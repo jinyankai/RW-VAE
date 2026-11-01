@@ -57,6 +57,13 @@ class RelevanceRateGate(nn.Module):
         shape = [1, self.channels] + [1] * (z.dim() - 2)
         return z * g.view(*shape)
 
+    def rate_allocation(self) -> torch.Tensor:
+        """Fraction of the (fixed) rate budget assigned to each channel, g / sum(g),
+        shape [C]. This is the quantity the relevance signal reshapes; comparing it
+        across allocation signals is the core 'latent organization' readout."""
+        g = self.gates()
+        return g / (g.sum() + 1e-8)
+
     def budget_penalty(self) -> torch.Tensor:
         """Squared deviation of total gate mass from the fixed budget.
 

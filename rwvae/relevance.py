@@ -58,6 +58,35 @@ def denoising_sensitivity(
 
 
 @torch.no_grad()
+def variance_allocation(latent: torch.Tensor) -> torch.Tensor:
+    """Baseline allocation by per-channel variance -- i.e. what plain reconstruction
+    favors (Main a: capacity to high-variance directions). Used as the 'wrong'
+    control to show generation-relevance != variance."""
+    B, C = latent.shape[:2]
+    return latent.reshape(B, C, -1).var(dim=(0, 2)).clamp_min(0.0)
+
+
+@torch.no_grad()
+def frequency_allocation(latent: torch.Tensor, cutoff: float = 0.5) -> torch.Tensor:
+    """Baseline allocation by per-channel high-frequency energy fraction -- the
+    frequency axis (FA-VAE / FreqWarm). Used as a control to show generation-
+    relevance != frequency. latent [B,C,H,W]; returns [C]."""
+    if latent.dim() != 4:
+        raise ValueError("frequency_allocation expects a spatial latent [B,C,H,W]")
+    B, C, H, W = latent.shape
+    fft = torch.fft.fftshift(torch.fft.fft2(latent, dim=(-2, -1)), dim=(-2, -1))
+    power = (fft.abs() ** 2)                                   # [B,C,H,W]
+    cy, cx = H // 2, W // 2
+    yy, xx = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
+    r = torch.sqrt(((yy - cy) ** 2 + (xx - cx) ** 2).float())
+    r = r / r.max()
+    high = (r >= cutoff).to(power)                            # high-frequency mask
+    hi_energy = (power * high).sum(dim=(-2, -1))             # [B,C]
+    total = power.sum(dim=(-2, -1)) + 1e-8
+    return (hi_energy / total).mean(dim=0).clamp_min(0.0)    # [C]
+
+
+@torch.no_grad()
 def alignment_relevance(latent: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """R2: per-channel alignment with a frozen semantic target.
 

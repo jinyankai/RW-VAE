@@ -8,8 +8,9 @@
 逐通道"率门"）、(3) 评估指标、(4) 接入 LightningDiT 的训练入口（GPU 部分已写好但在无
 GPU 环境下自动跳过）。
 
-当前状态（2026-11-01，CPU 环境）：**理论验证 25/25 通过，单元测试 22/22 通过，训练代码
-路径 CPU smoke 通过**。GPU 训练（ImageNet-256 + DiT-XL + gFID）代码已就绪、需在 GPU 节点运行。
+当前状态（2026-11-01，CPU 环境）：**理论验证 25/25 通过，单元测试 29/29 通过，E1/E2/架构
+PoC 三个脚本 CPU 全通过，训练代码路径 CPU smoke 通过**。GPU 训练（ImageNet-256 + DiT-XL +
+gFID）代码已就绪、需在 GPU 节点运行。
 
 ---
 
@@ -18,8 +19,9 @@ GPU 环境下自动跳过）。
 | 支柱（PROPOSAL §三） | 代码 |
 |---|---|
 | 一 · 理论（相图 + 深度桥梁） | `rwvae/theory.py`（闭式 + 模拟器）、`scripts/verify_theory.py`（E3 数值验证） |
-| 二 · 新架构 RW-VAE | `rwvae/gate.py`（`RelevanceRateGate`）、`rwvae/relevance.py`（R1 去噪敏感度 / R2 语义对齐）、`rwvae/integration.py`（接 VA-VAE）、`scripts/train_rwvae.py`（E4） |
-| 三 · 可访问性缺口 AG | `rwvae/metrics.py::accessibility_gap` / `linear_probe_risk` |
+| 二 · 新架构 RW-VAE | `rwvae/gate.py`（`RelevanceRateGate` + `rate_allocation`）、`rwvae/relevance.py`（R1 去噪敏感度 / R2 语义对齐 + 方差/频率基线）、`rwvae/integration.py`（接 VA-VAE）、`scripts/train_rwvae.py`（E4）、`scripts/demo_rwvae_synthetic.py`（架构 PoC） |
+| 二 · 受控干预（双射） | `rwvae/bijection.py`（`CouplingFlow`）、`scripts/eval_e2_bijection.py`（E2，验证引理 2） |
+| 三 · 可访问性缺口 AG | `rwvae/metrics.py::accessibility_gap` / `linear_probe_risk`、`scripts/eval_e1_ag.py`（E1） |
 | 四 · 廉价潜在指标 | `rwvae/metrics.py::effective_rank`（RankMe）/ `latent_power_spectrum` |
 
 ---
@@ -46,10 +48,19 @@ python scripts/verify_theory.py
 python -m pytest -q
 #    -> 22 passed
 
-# 3) 训练代码路径 CPU 冒烟测试（门前向/反向 + 相关性信号 + 损失装配，无需 GPU/数据）
+# 3) E2 双射干预（验证引理 2：重建不变、线性可用性坍塌、信息保留；CPU 真实实验）
+python scripts/eval_e2_bijection.py
+
+# 4) E1 可访问性缺口 AG 分解（恒等式 + 合成 demo；CPU）
+python scripts/eval_e1_ag.py
+
+# 5) 架构 PoC：在理论模型上训练真实率门，展示相关性重排把码率搬到任务子空间（CPU）
+python scripts/demo_rwvae_synthetic.py
+
+# 6) 训练代码路径 CPU 冒烟测试（门前向/反向 + 相关性信号 + 损失装配，无需 GPU/数据）
 python scripts/train_rwvae.py --smoke
 
-# 4) 真实训练（需 CUDA；无 GPU 时自动打印说明并以 exit 0 跳过）
+# 7) 真实训练（需 CUDA；无 GPU 时自动打印说明并以 exit 0 跳过）
 python scripts/train_rwvae.py
 ```
 
@@ -67,12 +78,16 @@ python scripts/train_rwvae.py
 rwvae/                         # 本仓库（git）
 ├── rwvae/                     # 包
 │   ├── theory.py              # 相图闭式 + 模拟器（numpy）
-│   ├── gate.py                # RelevanceRateGate：逐通道率门（新架构核心）
-│   ├── relevance.py           # R1 去噪敏感度 / R2 DINOv2 对齐
+│   ├── gate.py                # RelevanceRateGate：逐通道率门 + rate_allocation（新架构核心）
+│   ├── relevance.py           # 分配信号：R1 去噪敏感度 / R2 语义对齐 + 方差/频率基线
+│   ├── bijection.py           # CouplingFlow：可逆流（E2 受控干预）
 │   ├── metrics.py             # AG 分解、RankMe/有效秩、潜在功率谱
 │   └── integration.py         # GatedVAVAE：接 LightningDiT 的 VA-VAE（仅 GPU）
 ├── scripts/
 │   ├── verify_theory.py       # E3 理论数值验证（可直接运行）
+│   ├── eval_e2_bijection.py   # E2 双射干预（CPU 真实实验）
+│   ├── eval_e1_ag.py          # E1 可访问性缺口 AG 分解（CPU）
+│   ├── demo_rwvae_synthetic.py# 架构 PoC：率门在理论模型上端到端重排（CPU）
 │   └── train_rwvae.py         # E4 训练入口（--smoke CPU；真实训练需 GPU）
 ├── tests/                     # pytest
 ├── README.md  requirements.txt  pyproject.toml  LICENSE  .gitignore
@@ -93,6 +108,20 @@ rwvae/                         # 本仓库（git）
   推向"相关性序"。相关性信号两种，做消融：R1 去噪/生成敏感度（主、最新颖），R2 DINOv2 对齐（基线）。
 
 训练损失（见 `scripts/train_rwvae.py::rwvae_loss`）：`重建(gated latent) + λ_budget·预算 + λ_rel·相关性对齐`。
+
+**分配信号家族与分离论证**：同一个门可由不同的逐通道信号驱动，用于证明"生成相关性 ≠ 方差 ≠
+频率"——`rwvae/relevance.py` 提供 `denoising_sensitivity`(R1)、`alignment_relevance`(R2)、
+以及基线 `variance_allocation`（重建偏好的方差序）、`frequency_allocation`（FA-VAE/FreqWarm 频率轴）。
+`gate.rate_allocation()` 给出每通道占固定码率预算的比例，是"潜在组织方式"的核心读数。
+
+**架构 PoC（`demo_rwvae_synthetic.py`，已在 CPU 跑通）**：在理论的线性高斯模型上，固定总码率，
+重建驱动分配把码率灌到高方差干扰子空间（usability≈0.01），相关性驱动分配把 98.5% 码率搬到任务
+子空间（usability≈0.93）——端到端地证实"重排潜在组织 → 改变可用性"（线性模型里以更高失真为代价；
+图像中解码器的冗余使 rFID 仍可匹配）。
+
+**受控干预 E2（`eval_e2_bijection.py`）**：对冻结 latent 施加可逆 `CouplingFlow`，重建严格不变
+（可逆性误差 ~1e-6），对抗性细化后线性探针 R² 由 1.00 压到 0.00、而 MLP 探针仍 0.63——即引理 2
+"重建不变、线性可用性可被推向随机、信息保留"。
 
 ---
 
@@ -125,7 +154,7 @@ LightningDiT（MIT）打包了 VA-VAE + XL 级 DiT + latent 预缓存 + ADM FID 
 
 ## 无 GPU 时的行为（本次交付）
 
-- 理论验证、指标、门、单元测试、训练 smoke **全部在 CPU 跑通**。
+- 理论验证、指标、门、E1/E2/架构 PoC 三个脚本、单元测试、训练 smoke **全部在 CPU 跑通**。
 - `scripts/train_rwvae.py`（无 `--smoke`）检测到无 CUDA 时打印 GPU 运行说明并 `exit 0`，
   **不执行**真实训练（按毕设计划：写好代码、跳过 GPU 运行）。
 
