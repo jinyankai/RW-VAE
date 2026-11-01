@@ -1,0 +1,7 @@
+# Core (CPU-sufficient: theory verification, gate, metrics, tests)
+numpy>=1.26
+torch>=2.1
+pytest>=7.4
+
+# LightningDiT integration + real E4 training have their own deps; install from
+# third_party/LightningDiT/requirements.txt on the GPU node (see README).

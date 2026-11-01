@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Data / artifacts (never commit datasets, latents, checkpoints, eval stats)
+data/
+*.npz
+*.npy
+*.pt
+*.ckpt
+*.safetensors
+runs/
+outputs/
+wandb/
+
+# Third-party code is downloaded, not vendored (see README)
+third_party/

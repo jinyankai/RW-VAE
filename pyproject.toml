@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rwvae"
+version = "0.1.0"
+description = "Theory-anchored relevance-reweighting autoencoder for image generation (undergraduate thesis code)"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "torch>=2.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools]
+packages = ["rwvae"]
