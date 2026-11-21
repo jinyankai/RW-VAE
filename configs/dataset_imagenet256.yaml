@@ -1,0 +1,57 @@
+# ImageNet-1k (ILSVRC-2012), class-conditional 256x256 — the main dataset (plan v2.1 §1).
+# Fill in the /path/to/... entries on the GPU node. Relative paths are resolved against the repo root.
+# Use together with baseline_common.yaml and arms.yaml:
+#   --config configs/dataset_imagenet256.yaml --config configs/baseline_common.yaml --config configs/arms.yaml
+
+experiment:
+  name: imagenet256_ldm_f16d32
+  run_root: runs                         # outputs go to <run_root>/<name>/<stage>/
+
+seed: 2026
+
+dataset:
+  name: imagenet1k
+  train_root: /path/to/imagenet/train    # ImageFolder: <wnid>/<file>.JPEG (1,281,167 images, 1000 classes)
+  val_root: /path/to/imagenet/val        # official 50k val arranged as <wnid>/<file>.JPEG (D3: final evaluation only)
+  image_size: 256
+  num_classes: 1000
+  dev_per_class: 20                      # train_dev = 20 images/class (20k, D1); train_fit = the rest (D2)
+  split_seed: 2026
+  manifest: manifests/imagenet_split_seed2026.json
+
+tokenizer:                               # frozen, NOT DINO-aligned LDM f16d32 (plan §0.2)
+  name: ldm-imagenet256-f16d32-50ep      # hustvl/va-vae-imagenet256-experimental-variants
+  ckpt: /path/to/ldm-imagenet256-f16d32-50ep.ckpt
+  embed_dim: 32
+  ch_mult: [1, 1, 2, 2, 4]
+  latent_source: posterior_mean          # never posterior.sample (that is B_pub's protocol)
+
+cache:
+  dir: /path/to/cache/imagenet256_ldm_f16d32   # one sub-directory per split
+  splits: [train_fit, train_dev, val]
+  dtype: float16                         # storage only; statistics are accumulated in float64
+  flip: true                             # also cache mu of the horizontally flipped crop (training augmentation)
+  shard_size: 10000
+  batch_size: 64
+  num_workers: 8
+  verify_samples: 32                     # re-encode this many cached images and compare (DATA_CARD)
+
+semantic:                                # R2 teacher: DINOv2 patch features paired token-by-token with mu
+  model: vit_large_patch14_dinov2.lvd142m
+  input_size: 224                        # 224/14 = 16x16 patches <-> 16x16 latent tokens (normalised positions)
+  checkpoint_path: null                  # local weights file; null -> timm hub (set HF_ENDPOINT for a mirror)
+  autocast: bf16                         # features only feed second-order statistics
+
+stats:
+  split: train_fit                       # never val (plan §1.2)
+  num_groups: 16                         # image-ID hash groups -> image-level split-half / bootstrap
+  include_flip: false
+  batch_size: 64
+  num_workers: 8
+  max_images: null                       # cap for development runs
+  ridge_rel: 1.0e-3                      # lambda = ridge_rel * tr(Sigma_y) / D for Sigma_expl
+  ridge_scan: [0.0, 1.0e-4, 1.0e-3, 1.0e-2]
+  alignment_check:                       # plan §1.2 gate: the z<->y explained fraction must peak at shift (0,0)
+    num_images: 256                      # float64 copies of z, y: ~1.1 GB peak RAM for DINOv2-L
+    max_shift: 2
+  bootstrap: 50                          # group-bootstrap replicates for allocation stability (04)

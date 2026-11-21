@@ -1,7 +1,15 @@
-# Core (CPU-sufficient: theory verification, gate, metrics, tests)
+# RW-VAE v2.1 core: the rwvae library and its CPU unit tests (same list as pyproject.toml).
+# On a CUDA machine install torch/torchvision from download.pytorch.org first.
 numpy>=1.26
-torch>=2.1
+scipy>=1.11
+torch>=2.6
+torchvision>=0.21
+pyyaml>=6.0
+safetensors>=0.4
+pillow>=10.0
+tqdm>=4.66
 pytest>=7.4
 
-# LightningDiT integration + real E4 training have their own deps; install from
-# third_party/LightningDiT/requirements.txt on the GPU node (see README).
+# Real-asset / GPU path (third_party/LightningDiT, DINOv2 via timm, LPIPS, FID Inception, plots):
+# the "gpu" extra in pyproject.toml, i.e.  pip install -e ".[gpu]"
+#   timm einops fairscale torchdiffeq omegaconf requests lpips pytorch-fid matplotlib tensorboard

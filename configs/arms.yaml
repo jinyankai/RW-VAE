@@ -1,0 +1,31 @@
+# Experiment arms (plan v2.1 §4). Only B1-B3 are equal-nominal-rate comparisons.
+
+arms:
+  B0:
+    rule: none                           # mu / no channel: reference without a rate constraint
+  B1:
+    rule: equal_snr                      # same R, equal keep in every direction (PCA basis)
+  B2:
+    rule: variance                       # w = 1 reverse water-filling on eig(Sigma)
+  B3:
+    rule: r2                             # main method: DINO-relevance weighted KLT + water-filling
+
+grid:                                    # generator-free screening grid (M3)
+  R_nats: [11.0, 22.0, 33.0, 44.0]       # ~ {0.5, 1, 1.5, 2} bits per latent dim (C = 32)
+  w: [1.5, 2.0, 3.0]
+
+preregistration:                         # plan §8: frozen BEFORE any generator is trained
+  frozen: false
+  R_star: null
+  w_star: null
+  selection_split: train_dev
+  selection_rule: "R*, w* are chosen from M3 generator-free metrics only (never from gFID) and frozen here before 06_train_dit.py"
+  min_effect:
+    probe_top1_points: 3.0
+    gfid_rel: 0.03
+
+go_no_go:                                # M3 gates (plan §6; thresholds are project conventions)
+  overlap_max: 0.90                      # R2 vs variance whitened retention overlap must be <= this at some R
+  overlap_no_go: 0.97                    # >= this at every R -> rules not separable
+  stability_ratio_max: 0.333             # split-half retention difference / inter-rule distance
+  probe_diff_points: 3.0                 # R2 - variance probe top-1 difference with a CI excluding 0

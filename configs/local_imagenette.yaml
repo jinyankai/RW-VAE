@@ -1,0 +1,69 @@
+# LOCAL ENGINEERING TEST ONLY (RTX 4060 8 GB, Windows).
+# Imagenette = 10 ImageNet classes (9,469 train / 3,925 val images, real ImageNet photos).
+# It exercises the real production path (real tokenizer, real DINOv2, real LightningDiT, real FID code)
+# at tiny budgets. Its numbers are NOT ImageNet-1k results and must never be mixed into thesis tables.
+# Layer it LAST:
+#   --config configs/dataset_imagenet256.yaml --config configs/baseline_common.yaml \
+#   --config configs/arms.yaml --config configs/local_imagenette.yaml
+
+experiment:
+  name: local_imagenette
+  run_root: runs
+
+env:                                     # applied to os.environ before third-party imports
+  HF_HOME: E:/GraduateDesign/assets/hf_cache
+  HF_ENDPOINT: https://hf-mirror.com
+  TORCH_HOME: E:/GraduateDesign/assets/torch_cache
+
+dataset:
+  name: imagenette2-320
+  train_root: E:/GraduateDesign/assets/datasets/imagenette2-320/train
+  val_root: E:/GraduateDesign/assets/datasets/imagenette2-320/val
+  num_classes: 10
+  dev_per_class: 20
+  manifest: runs/local_imagenette/manifest.json
+
+tokenizer:
+  ckpt: E:/GraduateDesign/assets/checkpoints/ldm-imagenet256-f16d32-50ep.ckpt
+
+cache:
+  dir: E:/GraduateDesign/assets/cache/local_imagenette_ldm_f16d32
+  shard_size: 2000
+  batch_size: 32
+  num_workers: 4
+  verify_samples: 16
+
+stats:
+  batch_size: 32
+  num_workers: 4
+  alignment_check:
+    num_images: 128
+  bootstrap: 20
+
+train:
+  max_steps: 200
+  global_batch_size: 16                  # B/1 at batch 32 peaks at ~7.4 GiB on the 8 GB card
+  ema_decay: 0.99                        # short run: 0.9999 would leave the EMA at its initialisation
+  log_every: 20
+  ckpt_every: 100
+  num_workers: 2
+
+sample:
+  num_sampling_steps: 50
+  num_samples_screen: 1000
+  num_samples_final: 2000
+  batch_size: 50
+
+decoder_adapt:
+  images_per_class: 20
+  steps: 100
+  batch_size: 4
+  num_workers: 2
+  log_every: 10
+
+eval:
+  batch_size: 16
+  num_workers: 4
+  dct_images: 500
+  probe:
+    train_per_class: 200

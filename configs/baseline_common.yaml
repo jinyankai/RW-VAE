@@ -1,0 +1,106 @@
+# Shared recipe for every arm (plan v2.1 §4): same DiT, data, steps, sampling and evaluation protocol;
+# arms differ ONLY in the channel (configs/arms.yaml).
+
+dit:                                     # LightningDiT-B/1 (third_party/LightningDiT/models/lightningdit.py)
+  model_type: LightningDiT-B/1
+  input_size: 16
+  in_channels: 32
+  use_qknorm: false
+  use_swiglu: true
+  use_rope: true
+  use_rmsnorm: true
+  wo_shift: false
+  class_dropout_prob: 0.1
+  use_checkpoint: false
+  torch_compile: auto                    # auto = Linux + CUDA + triton only
+
+train:                                   # LightningDiT train.py recipe, with explicit seeds and EMA decay
+  split: train_fit
+  max_steps: 30000
+  global_batch_size: 256
+  lr: 2.0e-4
+  beta2: 0.95
+  weight_decay: 0.0
+  ema_decay: 0.9999
+  grad_clip: null
+  mixed_precision: bf16
+  log_every: 100
+  ckpt_every: 5000
+  keep_last: 3
+  num_workers: 8
+  seed: 2026
+  flip_prob: 0.5                         # mu vs mu_flip, chosen per (seed, epoch, image)
+  resample_noise_each_epoch: true        # channel noise resampled every epoch (false = frozen noise)
+  latent_multiplier: 1.0
+  noise_seed: 2026
+
+transport:
+  path_type: Linear
+  prediction: velocity
+  loss_weight: null
+  train_eps: null
+  sample_eps: null
+  use_cosine_loss: true
+  use_lognorm: true
+
+sample:                                  # main metric: gFID WITHOUT CFG (plan §5.1)
+  mode: ODE
+  sampling_method: euler
+  num_sampling_steps: 250
+  atol: 1.0e-6
+  rtol: 1.0e-3
+  reverse: false
+  timestep_shift: 0.3
+  cfg_scale: 1.0
+  batch_size: 64
+  num_samples_screen: 10000              # FID-10K: screening only
+  num_samples_final: 50000               # FID-50K (+ ADM evaluator on the saved npz): final results
+  label_seed: 2026                       # class-balanced labels, identical for every arm
+  noise_seed: 9001                       # initial noise per sample index, identical for every arm
+                                         # (must differ from train.noise_seed: both use noise_seed(base, 0, i))
+  mixed_precision: bf16
+
+decoder:
+  mode: lmmse                            # identity | lmmse (P6 fold into post_quant_conv); finetuned via --decoder-ckpt
+
+decoder_adapt:                           # M4 — only if needed; identical recipe and budget for every arm
+  split: train_fit
+  images_per_class: 100
+  steps: 5000
+  batch_size: 16
+  lr: 1.0e-4
+  betas: [0.5, 0.9]
+  l1_weight: 1.0
+  lpips_weight: 1.0
+  grad_clip: null
+  mixed_precision: bf16
+  noise_seed: 7
+  num_workers: 8
+  log_every: 50
+
+eval:                                    # M3 generator-free evaluation (05_eval_recon_probe.py)
+  split: train_dev                       # rule selection; run once more with eval.split=val for the final report
+  batch_size: 32
+  num_workers: 8
+  max_images: null
+  noise_seed: 1234                       # same channel noise for every arm (common random numbers)
+  lpips: true
+  rfid: true
+  dct_bands: 4
+  dct_images: 2000
+  probe:
+    train_split: train_fit
+    train_per_class: 50
+    pool_grid: 1                         # global average pooling of z' (fixed protocol)
+    weight_decay: 1.0e-4
+    max_iter: 200
+    noise_seed: 4321
+  bootstrap:
+    n_boot: 1000
+    seed: 0
+    alpha: 0.05
+
+fid:
+  inception_batch: 100
+  reference_split: val                   # reference statistics computed by 07_evaluate.py ref-stats
+  reference_stats: null                  # or an external npz with mu/sigma (e.g. ADM VIRTUAL_imagenet256_labeled.npz)

@@ -4,13 +4,40 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rwvae"
-version = "0.1.0"
-description = "Theory-anchored relevance-reweighting autoencoder for image generation (undergraduate thesis code)"
+version = "0.2.0"
+description = "RW-VAE v2.1: relevance-weighted rate allocation (weighted KLT, reverse water-filling, variance-preserving Gaussian channel) on frozen image-tokenizer latents for diffusion generation (undergraduate thesis code)"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.26", "torch>=2.1"]
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",          # evaluation: sqrtm for the Frechet distance
+    "torch>=2.6",           # generation: nn.utils.get_total_norm / clip_grads_with_norm_
+    "torchvision>=0.21",    # datasets: the ADM / LightningDiT image transform
+    "pyyaml>=6.0",
+    "safetensors>=0.4",
+    "pillow>=10.0",
+    "tqdm>=4.66",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
+# real-asset path: third_party/LightningDiT (models, transport, tokenizer), DINOv2 via timm,
+# LPIPS-VGG, the FID Inception, plotting and training logs
+gpu = [
+    "timm>=1.0",
+    "einops",
+    "fairscale",
+    "torchdiffeq",
+    "omegaconf>=2.3",
+    "requests",             # imported by LightningDiT tokenizer/autoencoder.py
+    "lpips>=0.1.4",
+    "pytorch-fid>=0.3",
+    "matplotlib",
+    "tensorboard",
+]
 
 [tool.setuptools]
 packages = ["rwvae"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["real_assets: needs downloaded checkpoints/datasets (set RWVAE_ASSETS)"]
