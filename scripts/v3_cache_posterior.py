@@ -78,8 +78,7 @@ def _encode(tok, dino, images, amp: bool):
 def cache(cfg, args, root: Path, rank: int, world: int, device, run) -> dict:
     c = cfg["v3_cache"]
     log = (run.logger.info if run is not None else (lambda *a, **k: None))
-    tok_path = Path(args.tokenizer) if args.tokenizer else _v3.tokenizer_path(cfg, args.arm)
-    tok, ckpt = tv3.load_tokenizer(tok_path, device)
+    tok, tok_path, _ = _v3.load_arm_tokenizer(cfg, args.arm, device, args.tokenizer)
     dino = _v3.make_dino(cfg, device)
     amp = device.type == "cuda"
     manifest = _common.load_manifest(cfg)

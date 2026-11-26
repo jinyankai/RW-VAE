@@ -70,6 +70,40 @@ def dit_dir(cfg: dict, arm: str, repa: bool) -> Path:
     return stage_dir(cfg, "dit", f"{arm}_repa" if repa else arm)
 
 
+class InitBaseline:
+    """The init tokenizer (VA-VAE, init.ckpt) behind the TokenizerV3 interface the v3 scripts use (encode -> {mu,
+    logvar, alpha=None}, decode, cfg), so the baseline goes through exactly the same cache / DiT / evaluation
+    protocol as a v3 arm. Its cfg asks DINO only for the last block (the REPA / probe target)."""
+
+    def __init__(self, frozen, target_layer: int):
+        from rwvae.tokenizer_v3 import V3Config
+        self.frozen = frozen
+        self.cfg = V3Config(dino_layers=(int(target_layer),))
+
+    def encode(self, images, dino_layers=None, freeze_gate: bool = False) -> dict:
+        mu, logvar = self.frozen.encode_moments(images)
+        return {"mu": mu, "logvar": logvar, "alpha": None}
+
+    def decode(self, z):
+        return self.frozen.decode(z)
+
+
+def load_arm_tokenizer(cfg: dict, arm: str, device, path=None):
+    """(tokenizer, path, checkpoint dict): `path` if given, else the arm's tokenizer.pt, or for an arm with
+    baseline_init (configs/v3.yaml v3_arms) the init tokenizer wrapped in InitBaseline."""
+    from rwvae import integration
+    from rwvae import tokenizer_v3 as tv3
+    if path is None and cfg.get("baseline_init"):
+        init = cfg["init"]
+        path = resolve(init["ckpt"])
+        frozen = integration.FrozenTokenizer.from_checkpoint(path, embed_dim=int(init["embed_dim"]),
+                                                             ch_mult=tuple(init["ch_mult"]), device=device)
+        return InitBaseline(frozen, max(cfg["v3"]["dino_layers"])), path, {}
+    path = Path(path) if path is not None else tokenizer_path(cfg, arm)
+    tok, ckpt = tv3.load_tokenizer(path, device)
+    return tok, path, ckpt
+
+
 def make_dino(cfg: dict, device):
     """Frozen DINOv2 with forward_layers (rwvae.integration.DinoPatchFeatures)."""
     return _common.make_semantic(cfg, device)

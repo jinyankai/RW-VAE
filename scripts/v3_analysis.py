@@ -49,8 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         device = runtime.select_device(args.device)
         _common.set_tf32(False)
-        tok_path = Path(args.tokenizer) if args.tokenizer else _v3.tokenizer_path(cfg, args.arm)
-        tok, _ = tv3.load_tokenizer(tok_path, device)
+        tok, _, _ = _v3.load_arm_tokenizer(cfg, args.arm, device, args.tokenizer)
         dino = _v3.make_dino(cfg, device)
         manifest = _common.load_manifest(cfg)
         summary = {"maps": gate_rate_maps(cfg, tok, dino, manifest, device, out_dir, run)}

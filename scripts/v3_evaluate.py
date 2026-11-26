@@ -78,9 +78,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _tokenizer(cfg, args, device):
     """(tokenizer, path, checkpoint dict): --tokenizer, else the arm's tokenizer.pt."""
-    path = Path(args.tokenizer) if args.tokenizer else _v3.tokenizer_path(cfg, args.arm)
-    tok, ckpt = tv3.load_tokenizer(path, device)
-    return tok, path, ckpt
+    return _v3.load_arm_tokenizer(cfg, args.arm, device, args.tokenizer)
 
 
 def _tok_tag(args) -> str:

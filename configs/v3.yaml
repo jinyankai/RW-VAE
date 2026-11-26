@@ -131,3 +131,4 @@ v3_arms:                                 # §3.1; every arm is merged over v3 / 
   T-f: {v3: {readout: shared}}
   L-a: {v3: {fusion: dino_only}, kl: {mode: lock}}
   L-c: {kl: {mode: lock}}
+  VA-VAE: {baseline_init: true}          # the init tokenizer itself through the same cache / DiT / eval protocol

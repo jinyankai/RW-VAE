@@ -197,6 +197,16 @@ def test_v3_pipeline_end_to_end(world):
     run("v3_evaluate", "--arm", "T-c", "--tokenizer", gan_tok, sub="generate")
     assert (exp / "gen" / "T-c" / "step2_n6_nocfg_tokenizer_gan" / "gen.json").is_file()
 
+    # the init tokenizer (VA-VAE) as an arm: same cache / DiT / evaluation protocol, no training of its own
+    run("v3_cache_posterior", "--arm", "VA-VAE")
+    vmeta = datasets.LatentCache(tmp / "cache" / "VA-VAE" / "mu" / "train_fit").meta
+    assert vmeta["tokenizer_sha256"] == runtime.sha256_file(tmp / "init.ckpt")
+    run("v3_train_dit", "--arm", "VA-VAE")
+    run("v3_evaluate", "--arm", "VA-VAE", sub="generate")
+    run("v3_evaluate", "--arm", "VA-VAE", sub="recon")
+    run("v3_analysis", "--arm", "VA-VAE")
+    assert "alpha_mean" not in json.loads((exp / "analysis" / "VA-VAE" / "maps.json").read_text())
+
     run("v3_analysis", "--arm", "T-c")
     maps = json.loads((exp / "analysis" / "T-c" / "maps.json").read_text())
     probe = json.loads((exp / "analysis" / "T-c" / "probe.json").read_text())
