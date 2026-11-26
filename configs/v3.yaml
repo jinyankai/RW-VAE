@@ -82,6 +82,10 @@ v3_dit:
   flip_prob: 0.5
   min_steps_per_epoch: 50                # small splits are repeated to at least this many steps per epoch
 
+sample:
+  cfg_interval_start: 0.11               # all-channel CFG only for t >= 0.11 (t = 0 noise), as LightningDiT;
+                                         # dit.class_dropout_prob stays 0.1 (null class for CFG / --uncond)
+
 repa:                                    # semantic anchor (RAEv2 / REPA); on only with --repa
   depth: 4                               # B/1 has 12 blocks; use 8 for XL/1 (28 blocks)
   weight: 0.5

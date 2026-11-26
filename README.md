@@ -26,7 +26,11 @@ torchrun --nproc_per_node 8 scripts/v3_cache_posterior.py $C --arm T-c      # �
 torchrun --nproc_per_node 8 scripts/v3_train_dit.py $C --arm T-c [--repa]
 python scripts/07_evaluate.py ref-stats $C --split val                     # 每个 experiment 只需一次
 python scripts/v3_evaluate.py recon $C --arm T-c
-python scripts/v3_evaluate.py generate $C --arm T-c [--repa] [--cfg-scale 1.5]
+python scripts/v3_evaluate.py generate $C --arm T-c [--repa]               # 主指标：无 CFG gFID
+python scripts/v3_evaluate.py generate $C --arm T-c --uncond                # 诊断：全空类采样（T3）
+python scripts/07_evaluate.py ref-stats $C --split train_dev               # CFG 调参用的参考统计，只需一次
+python scripts/v3_evaluate.py cfg-sweep $C --arm T-c --scales 1.25 1.5 2 3  # 在 train_dev 上选强度
+python scripts/v3_evaluate.py generate $C --arm T-c --cfg-scale <best> --num-samples 50000   # 选定后在 val 报告
 python scripts/v3_analysis.py $C --arm T-c                                  # 门控图、码率图、带噪探针曲线
 # 锁码率对照：--arm L-c / L-a --set kl.target=<T-c 实测 R_hat 取整>
 ```

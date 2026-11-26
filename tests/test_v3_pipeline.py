@@ -164,9 +164,17 @@ def test_v3_pipeline_end_to_end(world):
     assert {"psnr", "lpips", "rfid", "rate_nats_per_token"} <= set(rec)
     run("v3_evaluate", "--arm", "T-c", sub="generate")
     run("v3_evaluate", "--arm", "T-c", "--repa", "--cfg-scale", "2.0", sub="generate")
+    run("v3_evaluate", "--arm", "T-c", "--uncond", sub="generate")
     gen = json.loads((exp / "gen" / "T-c" / "step2_n6_nocfg" / "gen.json").read_text())
     assert "val" in gen["gfid"]
-    assert (exp / "gen" / "T-c_repa" / "step3_n6_cfg2" / "samples.png").is_file()
+    assert (exp / "gen" / "T-c_repa" / "step3_n6_cfg2_int0.11" / "samples.png").is_file()
+    assert json.loads((exp / "gen" / "T-c" / "step2_n6_uncond" / "gen.json").read_text())["uncond"] is True
+    with pytest.raises(FileNotFoundError, match="train_dev"):            # the sweep never tunes on val
+        run("v3_evaluate", "--arm", "T-c", "--scales", "1.5", sub="cfg-sweep")
+    run("07_evaluate", "--split", "train_dev", sub="ref-stats")
+    run("v3_evaluate", "--arm", "T-c", "--scales", "1.5", "2", sub="cfg-sweep")
+    sweep = json.loads((exp / "cfg_sweep" / "T-c" / "step2_n6_int0.11" / "sweep.json").read_text())
+    assert [r["cfg_scale"] for r in sweep["rows"]] == [1.5, 2.0] and "train_dev" in sweep["reference"]
 
     run("v3_analysis", "--arm", "T-c")
     maps = json.loads((exp / "analysis" / "T-c" / "maps.json").read_text())
@@ -186,6 +194,12 @@ def test_all_channel_cfg_scale_one_is_the_plain_model():
     guided = S["v3_evaluate"].AllChannelCFG(model, 3.0, 3)(x, t, y)
     uncond = model(x, t, torch.full_like(y, 3))
     assert torch.allclose(guided, uncond + 3.0 * (plain - uncond), atol=1e-5)
+    # guidance interval: no guidance where t < start (t = 0 is noise)
+    t2 = torch.tensor([0.05, 0.5])
+    out = S["v3_evaluate"].AllChannelCFG(model, 3.0, 3, interval_start=0.11)(x, t2, y)
+    cond2, unc2 = model(x, t2, y), model(x, t2, torch.full_like(y, 3))
+    assert torch.allclose(out[0], cond2[0], atol=1e-5)
+    assert torch.allclose(out[1], unc2[1] + 3.0 * (cond2[1] - unc2[1]), atol=1e-5)
 
 
 def test_dino_forward_layers_last_block_equals_forward():
