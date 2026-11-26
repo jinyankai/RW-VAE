@@ -77,9 +77,15 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _tokenizer(cfg, args, device):
+    """(tokenizer, path, checkpoint dict): --tokenizer, else the arm's tokenizer.pt."""
     path = Path(args.tokenizer) if args.tokenizer else _v3.tokenizer_path(cfg, args.arm)
-    tok, _ = tv3.load_tokenizer(path, device)
-    return tok, path
+    tok, ckpt = tv3.load_tokenizer(path, device)
+    return tok, path, ckpt
+
+
+def _tok_tag(args) -> str:
+    """'' for the arm's own tokenizer.pt, else '_<file stem>' (e.g. _tokenizer_gan), so outputs do not collide."""
+    return "" if not args.tokenizer else f"_{Path(args.tokenizer).stem}"
 
 
 class AllChannelCFG(nn.Module):
@@ -106,7 +112,7 @@ class AllChannelCFG(nn.Module):
 
 def cmd_recon(args, cfg: dict) -> int:
     e = cfg["v3_eval"]
-    name = "init_baseline" if args.baseline else args.arm
+    name = "init_baseline" if args.baseline else args.arm + _tok_tag(args)
     out_dir = Path(args.out) if args.out else _common.stage_dir(cfg, "recon", name)
     run = _common.open_run(__file__, cfg, out_dir, args)
     try:
@@ -118,7 +124,7 @@ def cmd_recon(args, cfg: dict) -> int:
             base = integration.FrozenTokenizer.from_checkpoint(tok_path, embed_dim=int(init["embed_dim"]),
                                                                ch_mult=tuple(init["ch_mult"]), device=device)
         else:
-            tok, tok_path = _tokenizer(cfg, args, device)
+            tok, tok_path, _ = _tokenizer(cfg, args, device)
             dino = _v3.make_dino(cfg, device)
         manifest = _common.load_manifest(cfg)
         n_split = manifest.split_size(e["split"])
@@ -188,9 +194,11 @@ class _Generator:
         self.ckpt_path = _pick(self.dit_run, args.ckpt)
         self.step = int(_CKPT.fullmatch(self.ckpt_path.name).group(1))
         self.info = json.loads((self.dit_run / "v3.json").read_text(encoding="utf-8"))
-        self.tok, tok_path = _tokenizer(cfg, args, device)
-        if runtime.sha256_file(tok_path) != self.info["tokenizer_sha256"]:
-            raise ValueError(f"{tok_path} is not the tokenizer the DiT in {self.dit_run} was trained on")
+        self.tok, tok_path, ckpt = _tokenizer(cfg, args, device)
+        # the DiT's own tokenizer, or one whose encoder is that tokenizer's (a decoder-only fine-tune)
+        if self.info["tokenizer_sha256"] not in (runtime.sha256_file(tok_path), ckpt.get("encoder_from_sha256")):
+            raise ValueError(f"{tok_path} is not the tokenizer the DiT in {self.dit_run} was trained on, nor a "
+                             "decoder fine-tune of it")
         train_cfg = runtime.load_config(self.dit_run / "config.yaml")
         self.num_classes = int(self.info["data"]["num_classes"])
         model = _common.build_dit(train_cfg, num_classes=self.num_classes)
@@ -272,7 +280,8 @@ def cmd_generate(args, cfg: dict) -> int:
     start = _interval(args, cfg)
     tag = "uncond" if args.uncond else (f"cfg{args.cfg_scale:g}_int{start:g}" if args.cfg_scale != 1.0 else "nocfg")
     dit_run, step = _dit_step(args, cfg)
-    out_dir = Path(args.out) if args.out else _common.stage_dir(cfg, "gen", dit_run.name, f"step{step}_n{N}_{tag}")
+    out_dir = Path(args.out) if args.out else _common.stage_dir(cfg, "gen", dit_run.name,
+                                                               f"step{step}_n{N}_{tag}{_tok_tag(args)}")
     refs = _refs(cfg, args.ref_stats)                 # before open_run: a missing reference leaves no run dir
     run = _common.open_run(__file__, cfg, out_dir, args)
     try:
@@ -305,7 +314,7 @@ def cmd_cfg_sweep(args, cfg: dict) -> int:
     start = _interval(args, cfg)
     dit_run, step = _dit_step(args, cfg)
     out_dir = Path(args.out) if args.out else _common.stage_dir(cfg, "cfg_sweep", dit_run.name,
-                                                               f"step{step}_n{N}_int{start:g}")
+                                                               f"step{step}_n{N}_int{start:g}{_tok_tag(args)}")
     refs = _refs(cfg, args.ref_stats, split="train_dev")
     run = _common.open_run(__file__, cfg, out_dir, args)
     try:

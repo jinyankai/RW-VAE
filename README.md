@@ -32,6 +32,9 @@ python scripts/07_evaluate.py ref-stats $C --split train_dev               # CFG
 python scripts/v3_evaluate.py cfg-sweep $C --arm T-c --scales 1.25 1.5 2 3  # 在 train_dev 上选强度
 python scripts/v3_evaluate.py generate $C --arm T-c --cfg-scale <best> --num-samples 50000   # 选定后在 val 报告
 python scripts/v3_analysis.py $C --arm T-c                                  # 门控图、码率图、带噪探针曲线
+torchrun --nproc_per_node 8 scripts/v3_finetune_decoder.py $C --arm T-c     # 只微调解码器（GAN），编码器与 DiT 不变
+python scripts/v3_evaluate.py recon $C --arm T-c --tokenizer runs/imagenet256_v3/tok/T-c/tokenizer_gan.pt
+python scripts/v3_evaluate.py generate $C --arm T-c --tokenizer runs/imagenet256_v3/tok/T-c/tokenizer_gan.pt
 # 锁码率对照：--arm L-c / L-a --set kl.target=<T-c 实测 R_hat 取整>
 ```
 

@@ -41,7 +41,7 @@ def _load(path: Path):
 
 S = {name: _load(REPO / "scripts" / f"{name}.py") for name in
      ("01_prepare_manifest", "07_evaluate", "v3_train_tokenizer", "v3_cache_posterior", "v3_train_dit",
-      "v3_evaluate", "v3_analysis")}
+      "v3_evaluate", "v3_analysis", "v3_finetune_decoder")}
 _common = importlib.import_module("_common")
 
 
@@ -117,6 +117,8 @@ def world(tmp_path, monkeypatch):
         "sample": {"num_sampling_steps": 3, "batch_size": 4, "num_samples_screen": 6},
         "fid": {"inception_batch": 4},
         "eval": {"num_workers": 0},
+        "dec_gan": {"max_steps": 3, "disc_warmup": 1, "global_batch_size": 4, "log_every": 1, "ckpt_every": 2,
+                    "num_workers": 0, "mixed_precision": "no"},
         "v3_eval": {"max_images": 4, "batch_size": 4, "num_workers": 0, "analysis_images": 4, "probe_t": [0.3, 0.8],
                     "probe_train_per_class": 2, "probe_test_per_class": 1},
     }
@@ -180,6 +182,21 @@ def test_v3_pipeline_end_to_end(world):
     sweep = json.loads((exp / "cfg_sweep" / "T-c" / "step2_n6_int0.11" / "sweep.json").read_text())
     assert [r["cfg_scale"] for r in sweep["rows"]] == [1.5, 2.0] and "train_dev" in sweep["reference"]
 
+    # decoder-only GAN fine-tune: encoder untouched, the DiT accepts the new tokenizer through encoder_from_sha256
+    run("v3_finetune_decoder", "--arm", "T-c")
+    base = torch.load(exp / "tok" / "T-c" / "tokenizer.pt", weights_only=True)["model"]
+    tuned = torch.load(exp / "tok" / "T-c" / "tokenizer_gan.pt", weights_only=True)
+    assert tuned["encoder_from_sha256"] == runtime.sha256_file(exp / "tok" / "T-c" / "tokenizer.pt")
+    dec_keys = [k for k in base if k.startswith(("decoder.", "post_quant_conv."))]
+    assert all(torch.equal(base[k], tuned["model"][k]) for k in base if k not in dec_keys)
+    assert any(not torch.equal(base[k], tuned["model"][k]) for k in dec_keys)
+    assert (exp / "tok" / "T-c" / "gan" / "checkpoints" / "0000003.pt").is_file()
+    gan_tok = str(exp / "tok" / "T-c" / "tokenizer_gan.pt")
+    run("v3_evaluate", "--arm", "T-c", "--tokenizer", gan_tok, sub="recon")
+    assert (exp / "recon" / "T-c_tokenizer_gan" / "recon.json").is_file()
+    run("v3_evaluate", "--arm", "T-c", "--tokenizer", gan_tok, sub="generate")
+    assert (exp / "gen" / "T-c" / "step2_n6_nocfg_tokenizer_gan" / "gen.json").is_file()
+
     run("v3_analysis", "--arm", "T-c")
     maps = json.loads((exp / "analysis" / "T-c" / "maps.json").read_text())
     probe = json.loads((exp / "analysis" / "T-c" / "probe.json").read_text())
@@ -220,3 +237,14 @@ def test_dino_forward_layers_last_block_equals_forward():
     feats = dino.forward_layers(x, [0, 2])
     assert feats.shape == (2, 2, 384, 4, 4)
     assert torch.allclose(feats[:, 1], dino(x), atol=1e-5)
+
+
+def test_gan_pieces():
+    from rwvae import gan
+    d = gan.NLayerDiscriminator()
+    assert d(torch.randn(2, 3, 64, 64)).shape == (2, 1, 6, 6)
+    assert float(gan.hinge_d_loss(torch.full((2,), 2.0), torch.full((2,), -2.0))) == 0.0
+    assert float(gan.hinge_d_loss(torch.zeros(2), torch.zeros(2))) == 1.0
+    w = torch.ones(3, requires_grad=True)
+    rec, g = (w * 2.0).sum(), (w * 4.0).sum()          # gradient norms 2*sqrt(3) and 4*sqrt(3)
+    assert abs(float(gan.adaptive_gan_weight(rec, g, w, 0.5)) - 0.25) < 1e-3

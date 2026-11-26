@@ -67,6 +67,25 @@ tok_train:
   num_workers: 8
   seed: 2026
 
+dec_gan:                                 # decoder-only GAN fine-tune (v3_finetune_decoder.py); encoder frozen
+  split: train_fit
+  max_steps: 15000
+  global_batch_size: 128
+  lr_decoder: 5.0e-5
+  lr_disc: 1.0e-4
+  betas: [0.5, 0.9]                      # LDM / VA-VAE autoencoder optimiser
+  disc_warmup: 2000                      # D trains from step 0; the adversarial term enters the decoder loss here
+  disc_weight: 0.5                       # VA-VAE f16d32 disc_weight (adaptive weight multiplier)
+  l1_weight: 1.0
+  lpips_weight: 1.0
+  mixed_precision: bf16
+  log_every: 100
+  ckpt_every: 5000
+  keep_last: 2
+  num_workers: 8
+  seed: 2026
+  noise_seed: 7
+
 v3_cache:
   dir: /path/to/cache/imagenet256_v3     # <dir>/<arm>/{mu,logvar}/<split>
   splits: [train_fit, train_dev, val]
