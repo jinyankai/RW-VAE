@@ -4,6 +4,35 @@
 
 v1（逐通道可学率门、双射干预、理论相图）保留为 L0 遗留代码，行为不变，说明在文末。
 
+## 0. v3.1（当前主线）：可扩散性来自信息分配
+
+v2.1 的有损信道删掉了细节，生成变差。v3 换成一个新 tokenizer：冻结 DINOv2-L 在深度上均匀取 8 层（第 3,6,…,24 层，各自 LayerNorm 后拼接，1×1 卷积）作语义支路，另加一条 RGB 卷积支路，两者按位置、按通道组由门控 α 混合，后验头输出 32×16×16 的高斯 latent。核心模块是**分噪声读出**：语义在强噪声（t=0.35）下读 DINO 特征，细节在弱噪声（t=0.80）下读 64×64 的 RGB 和边缘图。DiT 直接在标准化后的后验样本上训练，可选 REPA 语义 anchor；解码器从 VA-VAE 初始化，只做 L1 + LPIPS 重建。方案见 [`../auto-encoder/RWVAE_V3_ALLOCATION_PLAN.md`](../auto-encoder/RWVAE_V3_ALLOCATION_PLAN.md)。
+
+| 文件 | 作用 |
+|---|---|
+| `rwvae/tokenizer_v3.py` | 编码器两支路、门控、后验头、读出头、KL / 锁码率拉格朗日、存取 |
+| `rwvae/generation.py` | `train_dit(..., repa=REPAConfig, repa_target_fn=...)`：REPA 语义 anchor（v2 调用方式不变） |
+| `rwvae/datasets.py` | `PosteriorLatentDataset`：每个 (epoch, index) 重新采样 z = μ + σε，REPA 时附带同视图原图 |
+| `configs/v3.yaml`、`configs/v3_server.yaml` | v3 配置与实验臂预设 `v3_arms`（T-a…T-f、L-a、L-c） |
+| `scripts/v3_*.py` | 训练 tokenizer → 缓存后验 → 训练 DiT → 评测 → 分配分析 |
+
+一个实验臂的完整流程（A800 节点，`C` 为下列配置栈）：
+
+```bash
+C="--config configs/dataset_imagenet256.yaml --config configs/baseline_common.yaml --config configs/v3.yaml \
+   --config configs/server_a800.yaml --config configs/v3_server.yaml"
+torchrun --nproc_per_node 8 scripts/v3_train_tokenizer.py $C --arm T-c
+torchrun --nproc_per_node 8 scripts/v3_cache_posterior.py $C --arm T-c      # 写 stats.json，含实测码率
+torchrun --nproc_per_node 8 scripts/v3_train_dit.py $C --arm T-c [--repa]
+python scripts/07_evaluate.py ref-stats $C --split val                     # 每个 experiment 只需一次
+python scripts/v3_evaluate.py recon $C --arm T-c
+python scripts/v3_evaluate.py generate $C --arm T-c [--repa] [--cfg-scale 1.5]
+python scripts/v3_analysis.py $C --arm T-c                                  # 门控图、码率图、带噪探针曲线
+# 锁码率对照：--arm L-c / L-a --set kl.target=<T-c 实测 R_hat 取整>
+```
+
+前置：`init.ckpt` 指向 hustvl 公开的 VA-VAE-f16d32 权重（`vavae-imagenet256-f16d32-dinov2.pt`）；拿不到时可临时指向 LDM-f16d32。
+
 ---
 
 ## 1. 代码地图

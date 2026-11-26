@@ -1,0 +1,18 @@
+# MACHINE OVERLAY for the v3 scripts on the 8x A800 node. Layer after configs/server_a800.yaml:
+#   --config configs/dataset_imagenet256.yaml --config configs/baseline_common.yaml --config configs/v3.yaml \
+#   --config configs/server_a800.yaml --config configs/v3_server.yaml
+
+init:
+  ckpt: /home/jinyankai/assets/checkpoints/vavae-imagenet256-f16d32-dinov2.pt
+
+v3_cache:
+  dir: /home/jinyankai/cache/imagenet256_v3
+  batch_size: 128
+  num_workers: 12
+
+tok_train:
+  num_workers: 10                        # per rank: JPEG decode + DINOv2-L forward
+
+v3_eval:
+  batch_size: 128
+  num_workers: 16

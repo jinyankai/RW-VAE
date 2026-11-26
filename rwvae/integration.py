@@ -367,14 +367,26 @@ class DinoPatchFeatures(nn.Module):
         }
         self.eval().to(device)
 
-    @torch.no_grad()
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def _preprocess(self, images: torch.Tensor) -> torch.Tensor:
         _check_images(images)
         if images.shape[-1] != images.shape[-2]:
             raise ValueError(f"expected square images (one DINO grid per latent grid), got {tuple(images.shape[-2:])}")
         x = F.interpolate((images + 1) / 2, size=(self.input_size, self.input_size), mode="bilinear",
                           align_corners=False, antialias=True)
-        tokens = self.model.forward_features((x - self.mean) / self.std)
+        return (x - self.mean) / self.std
+
+    @torch.no_grad()
+    def forward_layers(self, images: torch.Tensor, indices: Sequence[int]) -> torch.Tensor:
+        """Patch tokens of the 0-based blocks `indices`, each passed through the model's final norm:
+        [B, len(indices), D, g, g] (same preprocessing as forward; the last block's entry equals forward's
+        output). Used by the v3 tokenizer, which fuses blocks spread over depth."""
+        feats = self.model.forward_intermediates(self._preprocess(images), indices=[int(i) for i in indices],
+                                                 norm=True, output_fmt="NCHW", intermediates_only=True)
+        return torch.stack(feats, 1)
+
+    @torch.no_grad()
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        tokens = self.model.forward_features(self._preprocess(images))
         B, N, D = tokens.shape
         g, p = self.grid, self.num_prefix_tokens
         if N != p + g * g:

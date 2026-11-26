@@ -702,6 +702,66 @@ class ChannelLatentDataset(Dataset):
         return x.float(), label, index
 
 
+class PosteriorLatentDataset(Dataset):
+    """v3 DiT training data (RWVAE_V3_ALLOCATION_PLAN.md §2.3): item `index` in epoch e ->
+    ((z - mean) / std as float32 [C, H, W], label, index[, image]) with z = mu + exp(logvar / 2) * eps
+    a fresh posterior sample.
+
+    Randomness: g = torch.Generator().manual_seed(noise_seed(base_seed, e, index)); u = torch.rand((),
+    generator=g) picks the flipped view iff u < flip_prob; eps = torch.randn((C, H, W), generator=g).
+    mu and logvar come from two caches of the same split written together (same rows, labels, flips).
+    With `manifest`, the item also carries the image of that row in the same view (hflip iff the flipped
+    latents were used), for the REPA target. Call set_epoch(e) before each epoch (see ChannelLatentDataset).
+    """
+
+    def __init__(self, mu_cache: LatentCache, logvar_cache: LatentCache, norm_mean, norm_std, *,
+                 base_seed: int, flip_prob: float = 0.5, manifest: Manifest | None = None, image_size: int = 256):
+        if (len(mu_cache), mu_cache.latent_shape, mu_cache.has_flip) != \
+                (len(logvar_cache), logvar_cache.latent_shape, logvar_cache.has_flip):
+            raise ValueError("the mu and logvar caches differ in length, latent shape or flip storage")
+        if mu_cache.meta.get("manifest_fingerprint") != logvar_cache.meta.get("manifest_fingerprint"):
+            raise ValueError("the mu and logvar caches come from different manifests")
+        C = mu_cache.latent_shape[0]
+        self.mean = _channel_vector("norm_mean", norm_mean, C).view(C, 1, 1)
+        self.std = _channel_vector("norm_std", norm_std, C).view(C, 1, 1)
+        if bool((self.std <= 0).any()):
+            raise ValueError(f"norm_std must be > 0, got min {float(self.std.min())}")
+        if not 0.0 <= flip_prob <= 1.0:
+            raise ValueError(f"flip_prob must lie in [0, 1], got {flip_prob!r}")
+        if flip_prob > 0 and not mu_cache.has_flip:
+            raise ValueError(f"flip_prob={flip_prob} but the cache stores no latents_flip")
+        if manifest is not None and manifest.fingerprint() != mu_cache.meta.get("manifest_fingerprint"):
+            raise ValueError("the manifest does not match the caches' manifest_fingerprint")
+        self.mu_cache, self.logvar_cache, self.manifest = mu_cache, logvar_cache, manifest
+        self.base_seed = _int_arg("base_seed", base_seed)
+        self.flip_prob = float(flip_prob)
+        self.transforms = None if manifest is None else (image_transform(image_size, False),
+                                                         image_transform(image_size, True))
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = _int_arg("epoch", epoch)
+
+    def __len__(self) -> int:
+        return len(self.mu_cache)
+
+    def __getitem__(self, index: int):
+        g = torch.Generator().manual_seed(noise_seed(self.base_seed, self.epoch, index))
+        flip = bool(torch.rand((), generator=g) < self.flip_prob)
+        mu, label, index = self.mu_cache.get(index, flip=flip)
+        logvar, label2, _ = self.logvar_cache.get(index, flip=flip)
+        if label2 != label:
+            raise ValueError(f"row {index}: mu cache label {label} != logvar cache label {label2}")
+        eps = torch.randn(mu.shape, generator=g, dtype=torch.float32)
+        z = mu + torch.exp(0.5 * logvar) * eps
+        x = ((z - self.mean.to(z.dtype)) / self.std.to(z.dtype)).float()
+        if self.manifest is None:
+            return x, label, index
+        with Image.open(self.manifest.image_path(self.mu_cache.split, index)) as img:
+            image = self.transforms[int(flip)](img)
+        return x, label, index, image
+
+
 class ImageLatentPairDataset(Dataset):
     """Decoder adaptation / reconstruction data: item k -> (image float32 [3, S, S] in [-1, 1],
     mu float32 [C, H, W], label, index) for row index = indices[k] of the split cache.split.

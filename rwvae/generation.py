@@ -246,9 +246,42 @@ class DiTTrainConfig:
         return cls(**d)
 
 
+# --------------------------------------------------------------------------- REPA semantic anchor (v3)
+@dataclass(frozen=True)
+class REPAConfig:
+    """REPA (arXiv:2410.06940) as the v3 semantic anchor (RWVAE_V3_ALLOCATION_PLAN.md §2.3): the output tokens
+    of DiT block `depth` (1-based) go through an MLP projector (Linear-SiLU-Linear-SiLU-Linear) and are pulled
+    towards frozen teacher patch tokens by loss weight * mean(1 - cos)."""
+
+    depth: int
+    weight: float = 0.5
+    proj_hidden: int = 2048
+    target_dim: int = 1024
+
+    def __post_init__(self) -> None:
+        for name in ("depth", "proj_hidden", "target_dim"):
+            _check_int(name, getattr(self, name), 1)
+        _check_real("weight", self.weight, lambda v: v > 0, "> 0")
+
+
+def build_repa_projector(hidden_size: int, cfg: REPAConfig) -> nn.Module:
+    return nn.Sequential(nn.Linear(hidden_size, cfg.proj_hidden), nn.SiLU(),
+                         nn.Linear(cfg.proj_hidden, cfg.proj_hidden), nn.SiLU(),
+                         nn.Linear(cfg.proj_hidden, cfg.target_dim))
+
+
+def repa_loss(projected: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """mean over tokens of 1 - cos(projected [B, T, D], target [B, D, H, W]) with T = H * W (row-major)."""
+    tgt = target.flatten(2).transpose(1, 2)
+    if tgt.shape != projected.shape:
+        raise ValueError(f"REPA target tokens {tuple(tgt.shape)} != projected DiT tokens {tuple(projected.shape)}")
+    return 1 - nn.functional.cosine_similarity(projected.float(), tgt.float(), dim=-1).mean()
+
+
 def train_dit(model: nn.Module, transport, dataset: Dataset, cfg: DiTTrainConfig, out_dir, *, device,
               logger: logging.Logger, resume: bool = False, log_fn: Callable[[int, dict], None] | None = None,
-              meta: Mapping | None = None) -> Path:
+              meta: Mapping | None = None, repa: REPAConfig | None = None,
+              repa_target_fn: Callable[[torch.Tensor], torch.Tensor] | None = None) -> Path:
     """Train `model` in place with LightningDiT's recipe; returns out_dir/checkpoints/{max_steps:07d}.pt.
 
     Processes: one, or DDP when WORLD_SIZE > 1 (torchrun; RANK and LOCAL_RANK from the environment). The
@@ -272,6 +305,11 @@ def train_dit(model: nn.Module, transport, dataset: Dataset, cfg: DiTTrainConfig
     fp16 on CUDA), step, epoch, batches_done_in_epoch, cfg (dict), invariants (what a resume must not
     change), meta, rng: one {python, numpy, torch, cuda} state per rank}. meta (JSON-serialisable, e.g.
     data/channel fingerprints and git commit; §1) is stored verbatim.
+
+    REPA (optional, v3): with `repa` set, dataset items must be (x, y, index, image) and repa_target_fn(images
+    on `device`) must return teacher tokens [B, target_dim, H, W] matching the DiT's token grid; the loss gains
+    repa.weight * repa_loss, the projector is trained with the DiT (same optimizer settings, DDP-synchronised),
+    is logged as loss_repa and stored under "repa_projector" in every checkpoint. The EMA covers the DiT only.
 
     resume=True continues the newest checkpoint (by step) exactly: weights, EMA, optimizer, scaler and
     RNG states are restored and the consumed batches of the interrupted epoch are skipped. It raises
@@ -299,6 +337,10 @@ def train_dit(model: nn.Module, transport, dataset: Dataset, cfg: DiTTrainConfig
         raise ValueError(f"global_batch_size={cfg.global_batch_size} is not divisible by WORLD_SIZE={world}")
     if cfg.seed * world + rank >= 2 ** 32:
         raise ValueError(f"process seed seed*world+rank = {cfg.seed * world + rank} must be < 2**32 (NumPy)")
+    if (repa is None) != (repa_target_fn is None):
+        raise ValueError("pass both repa and repa_target_fn, or neither")
+    if repa is not None and not 1 <= repa.depth <= len(model.blocks):
+        raise ValueError(f"repa.depth={repa.depth} outside the DiT's 1..{len(model.blocks)} blocks")
 
     own_group = False
     if world > 1:
@@ -316,14 +358,16 @@ def train_dit(model: nn.Module, transport, dataset: Dataset, cfg: DiTTrainConfig
                              f"match WORLD_SIZE={world}, RANK={rank}")
     try:
         return _train(model, transport, dataset, cfg, Path(out_dir), device=device, world=world, rank=rank,
-                      logger=logger, resume=resume, log_fn=log_fn, meta=meta)
+                      logger=logger, resume=resume, log_fn=log_fn, meta=meta, repa=repa,
+                      repa_target_fn=repa_target_fn)
     finally:
         if own_group:
             dist.destroy_process_group()
 
 
 def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, device: torch.device, world: int,
-           rank: int, logger, resume: bool, log_fn, meta: dict) -> Path:
+           rank: int, logger, resume: bool, log_fn, meta: dict, repa: REPAConfig | None = None,
+           repa_target_fn=None) -> Path:
     """Body of train_dit (the process group, if any, is set up)."""
     distributed = world > 1
     info, warn = (logger.info, logger.warning) if rank == 0 else (_silent, _silent)
@@ -341,7 +385,16 @@ def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, dev
     net = DDP(model, device_ids=[device.index] if device.type == "cuda" else None) if distributed else model
     update_ema(ema, model, 0.0)
     net.train()                                     # enables the label dropout that CFG relies on
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, betas=(0.9, cfg.beta2), weight_decay=cfg.weight_decay)
+    params = list(model.parameters())
+    projector = proj_net = None
+    hidden = {}
+    if repa is not None:                            # built after the EMA copy: the EMA is the DiT alone
+        projector = build_repa_projector(model.pos_embed.shape[-1], repa).to(device)
+        proj_net = DDP(projector, device_ids=[device.index] if device.type == "cuda" else None) \
+            if distributed else projector
+        params += list(projector.parameters())
+        model.blocks[repa.depth - 1].register_forward_hook(lambda mod, inp, out: hidden.__setitem__("h", out))
+    opt = torch.optim.AdamW(params, lr=cfg.lr, betas=(0.9, cfg.beta2), weight_decay=cfg.weight_decay)
     amp = device.type == "cuda" and cfg.mixed_precision != "no"
     scaler = torch.amp.GradScaler(device.type, enabled=amp and cfg.mixed_precision == "fp16")
 
@@ -357,6 +410,8 @@ def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, dev
 
     invariants = {**{k: getattr(cfg, k) for k in _TRAJECTORY_FIELDS}, "world_size": world,
                   "device_type": device.type, "dataset_len": len(dataset)}
+    if repa is not None:                            # absent (None) for runs without REPA, as in older checkpoints
+        invariants["repa"] = asdict(repa)
     step = epoch = batches_done = 0
     rng_state = None
     found = _list_checkpoints(ckpt_dir)
@@ -374,6 +429,8 @@ def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, dev
             raise ValueError(f"cannot resume {path}: its step {ckpt['step']} exceeds max_steps={cfg.max_steps}")
         model.load_state_dict(ckpt["model"])
         ema.load_state_dict(ckpt["ema"])
+        if projector is not None:
+            projector.load_state_dict(ckpt["repa_projector"])
         opt.load_state_dict(ckpt["opt"])
         if scaler.is_enabled():
             scaler.load_state_dict(ckpt["scaler"])
@@ -399,7 +456,7 @@ def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, dev
     if rng_state is not None:
         _set_rng_state(rng_state, device)           # last: nothing below draws from them before the next step
 
-    sums = torch.zeros(4, dtype=torch.float64, device=device)   # window sums: mse, cos, loss, grad norm
+    sums = torch.zeros(5, dtype=torch.float64, device=device)   # window sums: mse, cos, loss, grad norm, repa
     n_window, t_window, has_cos = 0, time.perf_counter(), False
     while step < cfg.max_steps:
         sampler.set_epoch(epoch)
@@ -410,29 +467,41 @@ def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, dev
                             pin_memory=device.type == "cuda", drop_last=True, persistent_workers=False,
                             generator=torch.Generator().manual_seed(noise_seed(cfg.seed, epoch, rank)))
         for items in loader:
-            x, y = _split_batch(items)
+            x, y, images = _split_batch(items)
             x = x.to(device, torch.float32, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            if repa is not None:
+                if images is None:
+                    raise ValueError("REPA needs dataset items (x, y, index, image)")
+                with torch.no_grad():
+                    target = repa_target_fn(images.to(device, non_blocking=True))
             terms = transport.training_losses(forward, x, dict(y=y))
             mse = terms["loss"].mean()
             has_cos = "cos_loss" in terms
             cos = terms["cos_loss"].mean() if has_cos else torch.zeros_like(mse)
             loss = mse + cos if has_cos else mse
+            if repa is not None:
+                with torch.autocast(device.type, dtype=_AMP_DTYPE[cfg.mixed_precision], enabled=amp):
+                    projected = proj_net(hidden.pop("h"))
+                loss_repa = repa_loss(projected, target)
+                loss = loss + repa.weight * loss_repa
+            else:
+                loss_repa = torch.zeros_like(mse)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            grad_norm = torch.nn.utils.get_total_norm([p.grad for p in model.parameters() if p.grad is not None])
+            grad_norm = torch.nn.utils.get_total_norm([p.grad for p in params if p.grad is not None])
             if not scaler.is_enabled() and not bool(torch.isfinite(grad_norm)):
                 raise FloatingPointError(f"non-finite gradient norm {float(grad_norm)} at step {step + 1} "
                                          f"(loss {float(loss.detach())})")
             if cfg.grad_clip is not None:
-                torch.nn.utils.clip_grads_with_norm_(model.parameters(), cfg.grad_clip, grad_norm)
+                torch.nn.utils.clip_grads_with_norm_(params, cfg.grad_clip, grad_norm)
             scaler.step(opt)
             scaler.update()
             update_ema(ema, model, cfg.ema_decay)
             step += 1
             batches_done += 1
-            sums += torch.stack([mse.detach(), cos.detach(), loss.detach(), grad_norm]).double()
+            sums += torch.stack([mse.detach(), cos.detach(), loss.detach(), grad_norm, loss_repa.detach()]).double()
             n_window += 1
 
             if step % cfg.log_every == 0 or step == cfg.max_steps:
@@ -440,11 +509,12 @@ def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, dev
                 if distributed:
                     dist.all_reduce(means)
                     means /= world
-                loss_mse, loss_cos, loss_total, grad_norm_mean = means.tolist()
+                loss_mse, loss_cos, loss_total, grad_norm_mean, loss_rp = means.tolist()
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 elapsed = time.perf_counter() - t_window
-                metrics = {"loss_mse": loss_mse, **({"loss_cos": loss_cos} if has_cos else {}), "loss": loss_total,
+                metrics = {"loss_mse": loss_mse, **({"loss_cos": loss_cos} if has_cos else {}),
+                           **({"loss_repa": loss_rp} if repa is not None else {}), "loss": loss_total,
                            "grad_norm": grad_norm_mean, "lr": opt.param_groups[0]["lr"],
                            "steps_per_sec": n_window / elapsed,
                            "samples_per_sec": n_window * cfg.global_batch_size / elapsed}
@@ -466,7 +536,8 @@ def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, dev
                         "model": model.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
                         "scaler": scaler.state_dict() if scaler.is_enabled() else None,
                         "step": step, "epoch": epoch, "batches_done_in_epoch": batches_done, "cfg": asdict(cfg),
-                        "invariants": invariants, "meta": meta, "rng": rng_states})
+                        "invariants": invariants, "meta": meta, "rng": rng_states,
+                        **({"repa_projector": projector.state_dict()} if projector is not None else {})})
                     removed = _prune_checkpoints(ckpt_dir, cfg.keep_last, newest=path)
                     info("saved %s (epoch %d, %d/%d batches)%s", path, epoch, batches_done, steps_per_epoch,
                          f"; removed {[p.name for p in removed]}" if removed else "")
@@ -482,11 +553,13 @@ def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, dev
     return final
 
 
-def _split_batch(items) -> tuple[torch.Tensor, torch.Tensor]:
-    if isinstance(items, (list, tuple)) and len(items) in (2, 3):
-        return items[0], items[1]
+def _split_batch(items) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """(x, y, images or None) of an (x, y), (x, y, index) or (x, y, index, image) batch."""
+    if isinstance(items, (list, tuple)) and len(items) in (2, 3, 4):
+        return items[0], items[1], items[3] if len(items) == 4 else None
     size = f" of length {len(items)}" if isinstance(items, (list, tuple)) else ""
-    raise ValueError(f"dataset items must be (x, y) or (x, y, index), got a {type(items).__name__}{size} batch")
+    raise ValueError(f"dataset items must be (x, y) or (x, y, index) (or (x, y, index, image) with REPA), got a "
+                     f"{type(items).__name__}{size} batch")
 
 
 def _rng_state(device: torch.device) -> dict:
