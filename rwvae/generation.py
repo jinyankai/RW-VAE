@@ -213,6 +213,7 @@ class DiTTrainConfig:
     beta2: float = 0.95
     weight_decay: float = 0.0
     ema_decay: float = 0.9999
+    ema_warmup: bool = False                # decay min(ema_decay, (1 + step) / (10 + step)) (timm / LDM EMA warm-up)
     grad_clip: float | None = None          # max global gradient L2 norm; None = no clipping
     mixed_precision: str = "bf16"           # "bf16" | "fp16" (with GradScaler) | "no"
     log_every: int = 100
@@ -412,6 +413,8 @@ def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, dev
                   "device_type": device.type, "dataset_len": len(dataset)}
     if repa is not None:                            # absent (None) for runs without REPA, as in older checkpoints
         invariants["repa"] = asdict(repa)
+    if cfg.ema_warmup:                              # likewise absent unless used
+        invariants["ema_warmup"] = True
     step = epoch = batches_done = 0
     rng_state = None
     found = _list_checkpoints(ckpt_dir)
@@ -498,7 +501,7 @@ def _train(model, transport, dataset, cfg: DiTTrainConfig, out_dir: Path, *, dev
                 torch.nn.utils.clip_grads_with_norm_(params, cfg.grad_clip, grad_norm)
             scaler.step(opt)
             scaler.update()
-            update_ema(ema, model, cfg.ema_decay)
+            update_ema(ema, model, min(cfg.ema_decay, (1 + step) / (10 + step)) if cfg.ema_warmup else cfg.ema_decay)
             step += 1
             batches_done += 1
             sums += torch.stack([mse.detach(), cos.detach(), loss.detach(), grad_norm, loss_repa.detach()]).double()

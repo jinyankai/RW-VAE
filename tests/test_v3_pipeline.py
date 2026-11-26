@@ -156,6 +156,7 @@ def test_v3_pipeline_end_to_end(world):
     run("v3_train_dit", "--arm", "T-c", "--repa")
     ck = torch.load(exp / "dit" / "T-c_repa" / "checkpoints" / "0000002.pt", weights_only=True)
     assert "repa_projector" in ck and ck["invariants"]["repa"]["depth"] == 1
+    assert ck["invariants"]["ema_warmup"] is True and ck["cfg"]["ema_warmup"] is True   # configs/v3.yaml
     assert "loss_repa" in json.loads((exp / "dit" / "T-c_repa" / "metrics.jsonl").read_text().splitlines()[-1])
     run("v3_train_dit", "--arm", "T-c", "--repa", "--resume", "--overwrite", "--set", "train.max_steps=3")
     assert (exp / "dit" / "T-c_repa" / "checkpoints" / "0000003.pt").is_file()
@@ -171,6 +172,8 @@ def test_v3_pipeline_end_to_end(world):
     run("v3_evaluate", "--arm", "T-c", sub="generate")
     run("v3_evaluate", "--arm", "T-c", "--repa", "--cfg-scale", "2.0", sub="generate")
     run("v3_evaluate", "--arm", "T-c", "--uncond", sub="generate")
+    run("v3_evaluate", "--arm", "T-c", "--weights", "model", sub="generate")
+    assert (exp / "gen" / "T-c" / "step2_n6_nocfg_raw" / "gen.json").is_file()
     gen = json.loads((exp / "gen" / "T-c" / "step2_n6_nocfg" / "gen.json").read_text())
     assert "val" in gen["gfid"]
     assert (exp / "gen" / "T-c_repa" / "step3_n6_cfg2_int0.11" / "samples.png").is_file()

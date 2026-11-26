@@ -101,6 +101,10 @@ v3_dit:
   flip_prob: 0.5
   min_steps_per_epoch: 50                # small splits are repeated to at least this many steps per epoch
 
+train:
+  ema_warmup: true                       # EMA decay min(0.9999, (1+step)/(10+step)): with plain 0.9999 a 30K-step run
+                                         # keeps ~5% of the zero-initialised step-0 weights and shrinks samples (std ~0.78)
+
 sample:
   cfg_interval_start: 0.11               # all-channel CFG only for t >= 0.11 (t = 0 noise), as LightningDiT;
                                          # dit.class_dropout_prob stays 0.1 (null class for CFG / --uncond)

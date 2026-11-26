@@ -58,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
         g.add_argument("--repa", action="store_true", help="use the arm's REPA DiT run")
         g.add_argument("--dit-run", default=None, help="DiT run directory (default: dit/<arm>[_repa])")
         g.add_argument("--ckpt", default="latest", help="checkpoint step or 'latest'")
+        g.add_argument("--weights", choices=("ema", "model"), default="ema",
+                       help="EMA or raw DiT weights of the checkpoint (outputs of 'model' are tagged _raw)")
         g.add_argument("--num-samples", type=int, default=None, help="default sample.num_samples_screen")
         g.add_argument("--cfg-interval-start", type=float, default=None,
                        help="no guidance for t below this (t = 0 is noise); default sample.cfg_interval_start")
@@ -82,8 +84,10 @@ def _tokenizer(cfg, args, device):
 
 
 def _tok_tag(args) -> str:
-    """'' for the arm's own tokenizer.pt, else '_<file stem>' (e.g. _tokenizer_gan), so outputs do not collide."""
-    return "" if not args.tokenizer else f"_{Path(args.tokenizer).stem}"
+    """'' for the arm's own tokenizer.pt, else '_<file stem>' (e.g. _tokenizer_gan), plus '_raw' for raw DiT
+    weights, so outputs do not collide."""
+    tag = "" if not getattr(args, "tokenizer", None) else f"_{Path(args.tokenizer).stem}"
+    return tag + ("_raw" if getattr(args, "weights", "ema") == "model" else "")
 
 
 class AllChannelCFG(nn.Module):
@@ -200,7 +204,7 @@ class _Generator:
         train_cfg = runtime.load_config(self.dit_run / "config.yaml")
         self.num_classes = int(self.info["data"]["num_classes"])
         model = _common.build_dit(train_cfg, num_classes=self.num_classes)
-        model.load_state_dict(torch.load(self.ckpt_path, map_location="cpu", weights_only=True)["ema"])
+        model.load_state_dict(torch.load(self.ckpt_path, map_location="cpu", weights_only=True)[args.weights])
         self.model = model.to(device).eval()
         self.has_null = float(model.y_embedder.dropout_prob) > 0      # the null-class row exists only then
         self.sample_fn = integration.build_ode_sample_fn(integration.build_transport(train_cfg["transport"]),
