@@ -13,6 +13,8 @@ import logging
 import os
 import random
 import re
+import shutil
+import subprocess
 import textwrap
 from datetime import date, datetime
 from pathlib import Path
@@ -23,10 +25,11 @@ import torch
 import yaml
 
 from rwvae.runtime import (Run, add_common_args, config_fingerprint, env_info, get_logger, git_commit,
-                           load_config, parse_config_from_args, save_config, seed_everything,
+                           git_dirty, load_config, parse_config_from_args, save_config, seed_everything,
                            select_device, sha256_file, to_jsonable)
 
-RECORD_KEYS = {"time", "script", "status", "out_dir", "config_fingerprint", "git_commit", "env", "summary"}
+RECORD_KEYS = {"time", "script", "status", "out_dir", "config_fingerprint", "git_commit", "git_dirty", "env",
+               "summary"}
 
 
 @pytest.fixture(autouse=True)
@@ -251,6 +254,7 @@ def test_run_lifecycle(tmp_path, capsys):
     assert rec["summary"] == {"fid": 12.5, "n": 3} and rec["config_fingerprint"] == run.fingerprint
     assert Path(rec["out_dir"]) == out.resolve() and rec["env"] == env_info()
     assert rec["git_commit"] is None or isinstance(rec["git_commit"], str)
+    assert rec["git_dirty"] is None or isinstance(rec["git_dirty"], bool)
     assert datetime.fromisoformat(rec["time"]).utcoffset().total_seconds() == 0
 
     os.remove(out / "log.txt")      # finish() released the log file (an open file cannot be deleted on Windows)
@@ -433,6 +437,36 @@ def test_git_commit_returns_hash_or_none(tmp_path):
     commit = git_commit()
     assert commit is None or re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", commit)
     assert git_commit(tmp_path / "does-not-exist") is None
+
+
+def test_git_dirty_sees_tracked_changes_and_untracked_files(tmp_path):
+    assert git_dirty(tmp_path / "does-not-exist") is None
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*a):
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                       check=True, capture_output=True)
+
+    git("init", "-q")
+    (repo / ".gitignore").write_text("ignored.txt\n")
+    (repo / "a.txt").write_text("1")
+    git("add", ".")
+    git("commit", "-q", "-m", "init")
+    assert git_dirty(repo) is False
+    (repo / "ignored.txt").write_text("x")             # ignored files do not count
+    assert git_dirty(repo) is False
+    (repo / "new.txt").write_text("x")                 # untracked, not ignored
+    assert git_dirty(repo) is True
+    (repo / "new.txt").unlink()
+    (repo / "a.txt").write_text("2")                   # modified tracked file
+    assert git_dirty(repo) is True
+    git("add", "a.txt")                                # staged but uncommitted
+    assert git_dirty(repo) is True
+    git("commit", "-q", "-m", "two")
+    assert git_dirty(repo) is False
 
 
 def test_env_info():

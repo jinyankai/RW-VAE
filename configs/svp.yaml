@@ -1,0 +1,97 @@
+# SVP = SANITY-VALIDATION PILOT (first real run; NOT a thesis result, never mixed into ImageNet-1k tables).
+# A small RANDOM subset of ImageNet-1k (10 classes x 100 train images + 50 official-val images per class)
+# goes through the whole pipeline 00 -> 07, and LightningDiT-B/1 is deliberately trained to OVERFIT the
+# 800 train_fit latents, so every metric has an obvious expected value (svp.pass_criteria below).
+# Build the subset first (the server agent may move the paths; keep them in sync with dataset.*_root):
+#   python scripts/tools/make_svp_subset.py --train-root /home/jinyankai/data/imagenet/train \
+#       --val-root /home/jinyankai/data/imagenet/val --out /home/jinyankai/data/svp/imagenet_c10_n100 \
+#       --num-classes 10 --train-per-class 100 --val-per-class 50 --seed 2026
+# Layer it AFTER the three base configs and the machine overlay:
+#   --config configs/dataset_imagenet256.yaml --config configs/baseline_common.yaml --config configs/arms.yaml \
+#   --config configs/server_a800.yaml --config configs/svp.yaml
+
+experiment:
+  name: svp                              # outputs under <run_root>/svp/<stage>/
+
+dataset:
+  name: imagenet1k_svp
+  train_root: /home/jinyankai/data/svp/imagenet_c10_n100/train
+  val_root: /home/jinyankai/data/svp/imagenet_c10_n100/val
+  num_classes: 10
+  dev_per_class: 20                      # -> train_dev 200 (20/class), train_fit 800 (80/class), val 500
+  manifest: manifests/svp_imagenet_c10_n100_seed2026.json
+
+cache:
+  dir: /home/jinyankai/cache/svp_imagenet_c10_n100_ldm_f16d32
+  shard_size: 100                        # train_fit = 8 shards (one per GPU process), train_dev 2, val 5
+  verify_samples: 32
+
+stats:
+  alignment_check:
+    num_images: 128
+  bootstrap: 20
+
+train:                                   # OVERFIT recipe (LightningDiT-B/1; no early stopping exists in train_dit)
+  max_steps: 20000                       # 20k x 256 / 800 = 6400 epochs over train_fit (x2 with flips): far past
+                                         # the point where B/1 (130M params) memorises 800 latents
+  global_batch_size: 256                 # unchanged recipe: 32 per GPU on 8 GPUs
+  ema_decay: 0.999                       # EMA horizon ~1k steps (5% of the run), so the EMA weights track the
+                                         # overfit model; 0.9999 (horizon 10k = half the run) would lag behind it
+  log_every: 100
+  ckpt_every: 2000
+  keep_last: 10                          # keep all 10 checkpoints: loss / gFID vs step is part of the check
+
+sample:
+  num_sampling_steps: 50
+  num_samples_screen: 1000               # 100 per class = 1.25 x train_fit; FID-1K, comparable only within the SVP
+  num_samples_final: 2000                # not used by the pass criteria
+
+decoder_adapt:                           # small budget; only if M4 is exercised
+  images_per_class: 80                   # = all train_fit images of a class
+  steps: 500
+  log_every: 50
+
+eval:
+  dct_images: 200                        # = all of train_dev
+  probe:
+    train_split: train_fit
+    train_per_class: 80                  # all train_fit images (80/class); tested on eval.split (train_dev 20/class)
+
+svp:                                     # documentation of the subset recipe and the checks the SVP report makes
+  subset:
+    num_classes: 10
+    train_per_class: 100
+    val_per_class: 50
+    seed: 2026
+    tool: scripts/tools/make_svp_subset.py
+  pass_criteria:                         # sanity thresholds (project conventions, fixed BEFORE the run)
+    dit_loss_drop:                       # 06 metrics.jsonl: the model fits the subset
+      rule: "mean train loss over the last 1k steps <= max_ratio x mean train loss over steps 1..1000"
+      max_ratio: 0.8
+    dit_loss_plateau:                    # ... and has converged (overfit reached, not still descending)
+      rule: "|mean loss of the last 2k steps - mean loss of the 2k steps before| / mean loss of the last 2k <= max_rel_change"
+      max_rel_change: 0.03
+    gfid_memorisation:                   # 07 generate (B0, EMA, final step) against two equal-size references
+      rule: "gFID(ref = train_fit, 500 images) / gFID(ref = val, 500 images) <= max_ratio"
+      ref_commands: "07_evaluate.py ref-stats --split train_fit --max-images 500; ref-stats --split val"
+      max_ratio: 0.7
+    nn_memorisation:                     # Inception pool-2048 features, L2; train_fit set includes h-flips
+      rule: "median NN distance(generated -> train_fit) <= max_ratio x median NN distance(val -> train_fit)"
+      max_ratio: 0.8
+    allocation_identity_residual:        # 04 allocations/allocations_summary.json, every (rule, R, w)
+      rule: "max identity residual (T Sigma T^T = diag(s), A Sigma A^T + B B^T = Sigma, sum r = R)"
+      max: 1.0e-8
+    latent_mse_vs_d_latent:              # 05: empirical latent MSE matches the closed-form D_latent
+      rule: "|empirical latent MSE - D_latent| / D_latent for every lossy arm and R"
+      max_rel_err: 0.05
+    monotone_in_rate:                    # 05: more rate never hurts (per lossy rule, R in grid.R_nats)
+      rule: "PSNR and probe top-1 non-decreasing, latent MSE non-increasing in R (up to the tolerances)"
+      psnr_tol_db: 0.05
+      probe_tol_points: 1.0
+    b0_reconstruction:                   # 05 B0 on train_dev: f16d32 LDM tokenizer, 256 px, no channel
+      rule: "psnr_min <= mean PSNR <= psnr_max and mean LPIPS <= lpips_max"
+      psnr_min: 23.0
+      psnr_max: 32.0
+      lpips_max: 0.25
+    data_gates:                          # 02 / 03
+      rule: "cache re-encode check passed for every split; alignment_shift_scan peak at shift (0, 0)"

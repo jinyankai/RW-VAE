@@ -491,20 +491,27 @@ def load_lpips(device) -> nn.Module                               # lpips.LPIPS(
 
 ## 4. 脚本（`scripts/`）
 
-所有脚本：`--config` 可多次（后者覆盖前者）、`--set a.b=v` 可多次（`+a.b=v` 新建键）、`--out` 覆盖输出目录、`--device`、`--seed`、`--overwrite`、`--resume`（`runtime.add_common_args`）；
-启动时写 `out/config.yaml`，结束时写 `out/summary.json` 并追加 `manifests/run_registry.jsonl`。
+所有阶段脚本：`--config` 可多次（后者覆盖前者）、`--set a.b=v` 可多次（`+a.b=v` 新建键）、`--out` 覆盖输出目录、`--device`、`--seed`、`--overwrite`、`--resume`（`runtime.add_common_args`；07 的这些通用参数写在子命令之后）。
+配置栈：ImageNet-1k = `dataset_imagenet256.yaml + baseline_common.yaml + arms.yaml + server_a800.yaml`；SVP 再叠 `svp.yaml`；本地工程测试 = 三个基础配置 + `local_imagenette.yaml`。
+输出默认在 `<experiment.run_root>/<experiment.name>/<阶段目录>/`。每次运行写 `config.yaml`、`log.txt`、`metrics.jsonl`，结束写 `summary.json`，并在 `manifests/run_registry.jsonl`（或配置键 `registry` 指定的文件，测试用）追加一行；记录含 `git_commit` 与 `git_dirty`（工作区有未提交改动或未忽略的未跟踪文件时为 true）。
 
-| 脚本 | 输入 | 输出 | 关键检查 |
-|---|---|---|---|
-| `00_verify_math.py` | 无（合成高斯 D0） | `verify_math.md`、`verify_math.json`、`figures/*.png`（`--figures`） | P1–P7 四类谱（随机 PD/重复谱/强相关/近奇异）、非高斯 KL、MC 协方差/LMMSE/D_latent、命题 C 推广阈值、CCA 恢复信号子空间、相图；任一失败 exit 1 |
-| `01_prepare_manifest.py` | train/val ImageFolder 根目录 | `manifest.json`、`DATA_CARD.md` | split 不相交、每类 dev 数、确定性、类映射哈希 |
-| `02_cache_latents.py` | manifest、tokenizer ckpt、split | 缓存目录（safetensors 分片 + cache_index.json） | `posterior.mean`；可选 flip；`--num-shards/--shard-id` 分片并行；结束时抽样重编码比对最大误差，追加到 DATA_CARD |
-| `03_estimate_stats.py` | manifest、train_fit 缓存、DINO | `stats.npz`、`group_moments.npz`、`diagnostics.json` | 联合 [z;y] float64 流式矩；PD/有效秩/条件数；多 ridge 的 K 谱；折半稳定性；对齐平移扫描峰值须在 (0,0)；`--merge` 合并分片状态 |
-| `04_solve_channel.py` | stats、arms 配置 | `allocations/*.npz`、`allocations_summary.{json,md}` | 每个 (rule,R,w) 的恒等式残差、D_latent、重叠矩阵、语义保留、折半/bootstrap 保留矩阵稳定性 vs 规则间距离（go/no-go） |
-| `05_eval_recon_probe.py` | 缓存（eval split + probe 训练 split）、allocations、tokenizer | `results.{json,md}` | 同图同噪声；PSNR/LPIPS/rFID、latent MSE vs D_latent、DCT 带功率比、线性探针 + 成对 bootstrap CI；B0 参考 |
-| `05b_adapt_decoder.py` | allocation（或 B0）、缓存+图像 | `decoder.safetensors` | L1+LPIPS 统一配方；各臂预算一致（配置记录） |
-| `06_train_dit.py` | 缓存、stats（归一化）、arm | `checkpoints/*.pt`、`metrics.jsonl` | 有损臂必须等于预登记 `R*/w*`（`preregistration.frozen=true`），否则需 `--exploratory` 并在 registry 标注 |
-| `07_evaluate.py` | 子命令 `ref-stats` / `generate` / `report` | 参考统计、gFID JSON（可选 ADM npz）、汇总表与图 | 无 CFG、类均衡标签、臂间共享初始噪声种子；FID-10K 与 50K 不混表 |
+| 脚本 | 脚本专有参数 | 输入 | 输出（相对实验目录） | 关键检查 / 退出码 |
+|---|---|---|---|---|
+| `00_verify_math.py` | `--quick`、`--figures`、`--registry PATH`（无需 config） | 无（合成高斯 D0） | `00_verify_math/verify_math.{json,md}`、`figures/*.png` | A 精确恒等式、B 蒙特卡洛、C 理论模型、D 守卫；任一失败 exit 1 |
+| `tools/make_svp_subset.py` | `--train-root --val-root --out`、`--num-classes 10 --train-per-class 100 --val-per-class 50 --seed 2026 --mode symlink\|copy`（普通 argparse，不写 registry） | ImageNet train/val ImageFolder | `<out>/{train,val}/<wnid>/*`、`<out>/svp_subset.json` | 确定性抽样；已存在且一致则 "up to date"，不一致报错 |
+| `01_prepare_manifest.py` | `--force` | train/val ImageFolder（SVP 时读 `<train_root>/../svp_subset.json`） | `cfg.dataset.manifest`、`DATA_CARD.md` §1、`01_manifest/manifest_info.json` | split 不相交、每类 dev 数、指纹；指纹变化需 `--force`；根目录移动则重写（roots_updated） |
+| `02_cache_latents.py` | `--split S`（可多次）、`--num-procs N --proc-id k`（兼容 RANK/WORLD_SIZE）、`--finalize`、`--no-verify` | manifest、tokenizer ckpt | `cache.dir/<split>/{*_shard#####.safetensors, cache_index.json, cache_verification.json}`、`DATA_CARD.md` §2、`02_cache/<splits>[/proc<k>of<N>][/finalize]/` | `posterior.mean`、fp32、TF32 关；已完成分片跳过；多进程后单独 `--finalize`；抽样重编码超出存储精度界即失败 |
+| `03_estimate_stats.py` | `--num-procs N --proc-id k`、`--merge`、`--max-images N`、`--allow-misaligned`、`--figures` | manifest、train_fit 缓存、DINO | `stats/{stats.npz, group_moments.pt, diagnostics.json, figures/}`、`stats/shards/acc_<k>.pt`、`DATA_CARD.md` §3 | 拒绝 val；对齐扫描峰值须在 (0,0)，否则 exit 2 且不写 stats |
+| `04_solve_channel.py` | `--figures` | `stats/stats.npz`、`group_moments.pt`、arms/grid | `allocations/{<name>.npz, none.npz, allocations_summary.{json,md}, figures/}` | 恒等式残差 >1e-8（MI 1e-6）即失败；重叠矩阵、折半/bootstrap 稳定性、go/no-go |
+| `05_eval_recon_probe.py` | `--split`、`--arms B0,B2`、`--R 11,22`、`--w 2`、`--max-images`、`--decoder-ckpt LABEL=PATH`、`--no-lpips`、`--no-rfid`、`--skip-probe`、`--skip-recon`、`--figures` | 缓存（eval split + probe 训练 split）、allocations、tokenizer、Inception、LPIPS | `recon_probe/<split>/{results.json, results.md, per_image.npz, ref_fid.npz, figures/}` | 一次读图服务所有臂、同噪声；探针门、R 单调性门（容差取自 `svp.pass_criteria.monotone_in_rate`，否则严格） |
+| `05b_adapt_decoder.py` | `--arm`、`--R`、`--w`、`--val-images N` | allocation（B0 无）、缓存 + 图像 | `decoders/<arm_label>/{decoder.safetensors, adapt.json}` | 统一 L1+LPIPS 配方；子集不足一个 batch 报错 |
+| `06_train_dit.py` | `--arm`、`--R`、`--w`、`--exploratory`（多卡用 `torchrun`） | train_fit 缓存、stats、allocation | `dit/<arm_label>/{checkpoints/*.pt, arm.json, metrics.jsonl}` | 有损臂须等于冻结的 `R*/w*`，否则需 `--exploratory`；小数据集自动重复（`arm.json` 的 `repeat`） |
+| `07_evaluate.py ref-stats` | `--split`、`--max-images N`（等间距行）、`--save-features [--hflip]` | manifest 图像 | `fid_ref/<split>[_n<N>].npz`、`fid_ref/<split>[_n<N>]_features.npz` | Inception pool3，TF32 关 |
+| `07_evaluate.py generate` | `--arm --R --w`、`--dit-run`、`--ckpt latest\|STEP`、`--num-samples`、`--decoder-ckpt`、`--ref-stats [LABEL=]PATH`（可多次）、`--nn-ref LABEL=NPZ`、`--nn-baseline NPZ`、`--save-npz`、`--save-grid K` | 06 运行目录、参考统计 | `gen/<arm_label>/step<k>_n<N>/{results.json, results.md, gen_fid_stats.npz, samples.npz, grid.png}` | `cfg_scale` 必须为 1；类均衡标签、臂间同初始噪声；`fid_kind`（FID-10K/50K/N）永不混表；单进程 |
+| `07_evaluate.py report` | 无（重跑需 `--overwrite`） | `recon_probe/*`、`allocations/allocations_summary.json`、`dit/*`、`gen/**`、缓存校验与 `stats/diagnostics.json` | `report/{REPORT.md, report.json, figures/}` | 有 `svp` 配置块时输出 “SVP verdict” 一节 |
+
+流水线驱动：`scripts/run_pipeline.sh svp|imagenet`（Linux 8 卡节点）与 `scripts/run_local_imagenette.ps1`（Windows 本机），一阶段一条命令、遇错即停，`--from STAGE` / `-From STAGE` 从中途继续。
+ImageNet-1k 数据：`scripts/tools/imagenet_parquet_to_folder.py`（HF `ILSVRC/imagenet-1k` parquet → ImageFolder）。
 
 ### 4.1 脚本详细规格（2026-11-17 设计；实现状态见 `../auto-encoder/handoff_v2.md`）
 
@@ -533,7 +540,7 @@ def load_lpips(device) -> nn.Module                               # lpips.LPIPS(
 - **04_solve_channel**：对每个有损臂 × `grid.R_nats` ×（r2 的）`grid.w` 解 `solve_allocation` 存 `allocations/<name>.npz`（另存 `none.npz`）；
   每个分配：bpp、激活方向数、θ、D_latent、加权失真、语义保留、方向相关度、恒等式残差（超 1e-8 即失败，MI 地板除外）；
   每个 R 的规则间保留重叠；折半与组 bootstrap（`stats.bootstrap` 次）保留矩阵距离 vs 规则间距离；按 `go_no_go` 判定可分/稳定；
-  输出 `allocations/summary.{json,md}`（`--figures` 出 κ 曲线与重叠热图）。
+  输出 `allocations/allocations_summary.{json,md}`（`summary.json` 归 `runtime.Run`；`--figures` 出 κ 曲线与重叠热图）。
 - **05_eval_recon_probe**：`--split`（默认 eval.split；选规则用 train_dev，终报才用 val）、`--arms`、`--R`、`--w`、`--max-images`、
   `--decoder-ckpt LABEL=PATH`、`--no-lpips`、`--no-rfid`、`--skip-probe`、`--skip-recon`、`--figures`；**一次遍历图像服务所有臂**；
   所有臂同噪声 `noise_seed(eval.noise_seed, 0, i)`；每图 PSNR（to_uint8）、LPIPS、各臂 FIDStatistics + 原图参考统计（缓存为 ref_fid.npz）、
@@ -552,7 +559,31 @@ def load_lpips(device) -> nn.Module                               # lpips.LPIPS(
   [--num-samples] [--decoder-ckpt] [--ref-stats] [--save-npz] [--save-grid K]`：EMA 权重、`cfg_scale` 必须为 1（否则拒绝）、
   `class_balanced_labels(N, K, label_seed)`、初始噪声索引 0..N−1（臂间相同）、`sample_latents` → `denormalize` → 臂的解码器 → to_uint8 →
   FIDStatistics → gFID；结果写 `gen/<arm_label>/step<k>_n<N>/results.json`（fid_kind：FID-10K/FID-50K/FID-N，永不混表）；
-  `--save-npz` 写 ADM 格式 `arr_0`；`report` 汇总 recon_probe 与 gen 结果为 `report/REPORT.md`（多种子取均值±标准差；本地 Imagenette 结果在表头标明为工程测试）。
+  `--save-npz` 写 ADM 格式 `arr_0`；`--nn-ref LABEL=特征npz` 与 `--nn-baseline` 给出样本到参考集的最近邻（余弦与 L2，SVP 记忆检查用，特征由 `ref-stats --save-features [--hflip]` 生成）；`report` 汇总 recon_probe 与 gen 结果为 `report/REPORT.md`（多种子取均值±标准差；本地 Imagenette 结果在表头标明为工程测试）。
+
+
+### 4.2 SVP（sanity-validation pilot，第一次真实运行）
+
+目的：在正式 ImageNet-1k 运行前，用一个随机小子集把 00 → 07 全部跑通，并让每个指标都有显而易见的预期值。它不是论文结果，不与 ImageNet-1k 混表（报告抬头会标明）。
+
+- 数据：`make_svp_subset.py` 从 ImageNet train 随机取 10 类 × 100 张，另取这 10 类各 50 张官方 val（seed 2026）。`dev_per_class=20`，得到 train_fit 800、train_dev 200、val 500。
+- 配置：`svp.yaml`（叠在 `server_a800.yaml` 之后）只改数据路径、缓存目录、实验名 `svp` 和小预算。生成器配方仍是 LightningDiT-B/1，但 `max_steps 20000`（约 6400 个 epoch）、`ema_decay 0.999`，故意过拟合 800 个 latent。
+- 顺序（`run_pipeline.sh svp`）：00 → 子集 → 01 → 02（8 进程分片 + `--finalize`）→ 03（8 进程分片 + `--merge`）→ 04 → 05（train_dev，全网格）→ 05b（B0-adapt）→ 06（torchrun，B0、B2@R22、B3@R22 w2，均 `--exploratory`）→ 07 ref-stats（train_fit 500 张；train_fit 特征含翻转；val 及其特征）→ 07 generate（每臂对 train/val 两个参考算 gFID，对 train_fit 做最近邻）→ 07 report。
+- 判据：`svp.pass_criteria`，在 07 report 的 “SVP verdict” 一节逐条给出数值、阈值和 PASS/FAIL；缺输入的判据列为 “Not evaluated”，不会算作通过。
+
+| 判据 | 数据来源 | 阈值（运行前固定） |
+|---|---|---|
+| `dit_loss_drop` | `dit/*/metrics.jsonl` | 最后 1k 步均值 / 前 1k 步均值 ≤ 0.8 |
+| `dit_loss_plateau` | 同上 | 最后两个 2k 窗口均值的相对变化 ≤ 3% |
+| `gfid_memorisation` | B0 末步 `gen/.../results.json` | gFID(train_fit 500) / gFID(val 500) ≤ 0.7 |
+| `nn_memorisation` | 同上（`--nn-ref`、`--nn-baseline`） | 样本→train_fit 的 L2 最近邻中位数 ≤ 0.8 × val→train_fit 的中位数 |
+| `allocation_identity_residual` | `allocations/allocations_summary.json` | 所有分配的恒等式残差 ≤ 1e-8 |
+| `latent_mse_vs_d_latent` | `recon_probe/*/results.json` | 每个有损臂 \|经验 latent MSE − D_latent\| / D_latent ≤ 0.05 |
+| `monotone_in_rate` | 同上 | PSNR、探针 top-1 随 R 不降（容差 0.05 dB / 1 点），latent MSE 不升 |
+| `b0_reconstruction` | `recon_probe/train_dev/results.json` 的 B0 | PSNR ∈ [23, 32] dB 且 LPIPS ≤ 0.25 |
+| `data_gates` | `cache/<split>/cache_verification.json`、`stats/diagnostics.json` | 每个 split 重编码校验通过，对齐峰值在 (0,0) |
+
+`tests/test_pipeline_smoke.py` 在 CPU 上用合成图像、微型 tokenizer 和假 DINO/Inception/LPIPS 跑同一条链（含 `svp.yaml`），断言每阶段产物存在、九条判据全部可评估、registry 每阶段一行。
 
 ---
 

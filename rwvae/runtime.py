@@ -2,7 +2,7 @@
 
 - config: YAML files deep-merged left to right plus dotted ``a.b.c=VALUE`` overrides
   (`load_config`, `save_config`, `config_fingerprint`);
-- provenance for artifact ``meta`` (plan v2.1 Sec. 3.2): `sha256_file`, `git_commit`, `env_info`;
+- provenance for artifact ``meta`` (plan v2.1 Sec. 3.2): `sha256_file`, `git_commit`, `git_dirty`, `env_info`;
 - reproducibility: `seed_everything`, `select_device`;
 - run directory: `Run` owns ``config.yaml``, ``log.txt``, ``metrics.jsonl`` and ``summary.json``
   in its out_dir and appends one record per finished run to ``manifests/run_registry.jsonl``;
@@ -243,7 +243,7 @@ def sha256_file(path: str | os.PathLike, chunk: int = 1 << 20) -> str:
 
 def git_commit(repo_dir: str | os.PathLike | None = None) -> str | None:
     """HEAD commit of the git repo at repo_dir (default: this repo), or None when git or the
-    repo is unavailable; never raises. Uncommitted changes are not detected."""
+    repo is unavailable; never raises. Uncommitted changes are reported by `git_dirty`."""
     repo = REPO_ROOT if repo_dir is None else repo_dir
     try:
         res = subprocess.run(["git", "-C", os.fspath(repo), "rev-parse", "HEAD"],
@@ -251,6 +251,19 @@ def git_commit(repo_dir: str | os.PathLike | None = None) -> str | None:
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return res.stdout.decode("ascii", errors="replace").strip() or None
+
+
+def git_dirty(repo_dir: str | os.PathLike | None = None) -> bool | None:
+    """True if the work tree at repo_dir (default: this repo) differs from HEAD: modified or staged
+    tracked files, or untracked files that .gitignore does not exclude. None when git or the repo is
+    unavailable; never raises. A run with git_dirty=True is not reproducible from git_commit alone."""
+    repo = REPO_ROOT if repo_dir is None else repo_dir
+    try:
+        res = subprocess.run(["git", "-C", os.fspath(repo), "status", "--porcelain", "--untracked-files=normal"],
+                             capture_output=True, timeout=30, check=True)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return bool(res.stdout.strip())
 
 
 def env_info() -> dict:
@@ -420,12 +433,12 @@ class Run:
         self._log_path = self.out_dir / "log.txt"
         get_logger(PACKAGE_LOGGER, self._log_path)
         self.logger = logging.getLogger(f"{PACKAGE_LOGGER}.{Path(script).stem}")
-        self._commit, self._env = git_commit(), env_info()
+        self._commit, self._dirty, self._env = git_commit(), git_dirty(), env_info()
         self._finished = False
 
         mode = "resume" if self.resumed else ("overwrite" if existed else "new")
-        self.logger.info("run start (%s): script=%s out_dir=%s config=%s git=%s", mode, script,
-                         self.out_dir.as_posix(), self.fingerprint, self._commit)
+        self.logger.info("run start (%s): script=%s out_dir=%s config=%s git=%s dirty=%s", mode, script,
+                         self.out_dir.as_posix(), self.fingerprint, self._commit, self._dirty)
         self.logger.info("argv: %s", " ".join(sys.argv))
         self.logger.info("env: %s", json.dumps(self._env, ensure_ascii=False))
         if resume and not existed:
@@ -461,7 +474,7 @@ class Run:
         """Write summary.json and append the same record to the run registry, then close log.txt.
 
         Record: time (ISO-8601 UTC), script, status, out_dir, config_fingerprint, git_commit,
-        env (`env_info()` at start), summary.
+        git_dirty (`git_dirty()` at start), env (`env_info()` at start), summary.
         """
         if self._finished:
             raise RuntimeError(f"finish() was already called for the run in {self.out_dir}")
@@ -470,7 +483,7 @@ class Run:
         record = to_jsonable({
             "time": _utc_now(), "script": self.script, "status": status,
             "out_dir": self.out_dir, "config_fingerprint": self.fingerprint,
-            "git_commit": self._commit, "env": self._env, "summary": summary,
+            "git_commit": self._commit, "git_dirty": self._dirty, "env": self._env, "summary": summary,
         })
         _write_text_atomic(self.out_dir / "summary.json",
                            json.dumps(record, indent=2, ensure_ascii=False, allow_nan=False) + "\n")

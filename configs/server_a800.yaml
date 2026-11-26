@@ -1,0 +1,45 @@
+# MACHINE OVERLAY for the Linux GPU node (8x A800-80GB, 128 CPU cores). It does NOT change the dataset
+# protocol: it fills in the node's paths (full ImageNet-1k, tokenizer checkpoint, weight caches, latent cache)
+# and the batch sizes / DataLoader workers. Layer it after the three base configs:
+#   ImageNet-1k: --config configs/dataset_imagenet256.yaml --config configs/baseline_common.yaml \
+#                --config configs/arms.yaml --config configs/server_a800.yaml
+#   SVP:         ... --config configs/server_a800.yaml --config configs/svp.yaml
+# Multi-GPU scripts run under torchrun (02 cache sharding, 06 DDP training); workers below are PER process.
+
+env:                                     # applied to os.environ before third-party imports
+  HF_HOME: /home/jinyankai/assets/hf_cache
+  HF_ENDPOINT: https://hf-mirror.com
+  TORCH_HOME: /home/jinyankai/assets/torch_cache
+
+dataset:
+  train_root: /home/jinyankai/data/imagenet/train
+  val_root: /home/jinyankai/data/imagenet/val
+
+tokenizer:
+  ckpt: /home/jinyankai/assets/checkpoints/ldm-imagenet256-f16d32-50ep.ckpt
+
+cache:
+  dir: /home/jinyankai/cache/imagenet256_ldm_f16d32
+  batch_size: 128                        # 8 processes x 12 workers ~ 96 of 128 cores (JPEG decode is the bottleneck)
+  num_workers: 12
+
+stats:
+  batch_size: 128
+  num_workers: 12
+
+train:
+  global_batch_size: 256                 # LightningDiT-B default: 32 per GPU on 8 GPUs
+  num_workers: 8                         # per rank; latents are read from the cache, little CPU work
+
+sample:
+  batch_size: 250
+
+fid:
+  inception_batch: 250
+
+decoder_adapt:
+  num_workers: 8
+
+eval:
+  batch_size: 128
+  num_workers: 16

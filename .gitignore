@@ -18,6 +18,7 @@ data/
 *.ckpt
 *.safetensors
 runs/
+runs_server/
 outputs/
 wandb/
 
