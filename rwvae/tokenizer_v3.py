@@ -254,10 +254,15 @@ class TokenizerV3(nn.Module):
         return [p for p in self.parameters() if id(p) not in dec]
 
     # ---------------------------------------------------------------- encoder
-    def encode(self, images: torch.Tensor, dino_layers: torch.Tensor) -> dict:
+    def encode(self, images: torch.Tensor, dino_layers: torch.Tensor, freeze_gate: bool = False) -> dict:
         """images [B, 3, S, S] in [-1, 1]; dino_layers [B, L, D, g, g] (the blocks of cfg.dino_layers, in that
         order, each after the DINO final norm). Returns {mu, logvar, alpha ([B, groups, g, g]; None for
-        dino_only), d, r}."""
+        dino_only), d, r}.
+
+        freeze_gate (adaptive fusion only) pins alpha at 0.5 while still running the gate network times 0, so
+        under DDP every parameter takes part and the gate gets zero gradient. The training script sets it during
+        the warm-up: regressing onto the VA-VAE posterior mean (itself DINO-aligned) otherwise drives alpha to
+        ~1 before the real objective starts (seen on the first T-c run: alpha 0.9999 at step 800)."""
         cfg = self.cfg
         B, L = dino_layers.shape[:2]
         if L != len(cfg.dino_layers):
@@ -273,6 +278,8 @@ class TokenizerV3(nn.Module):
                 alpha = torch.full((B, cfg.groups, *d.shape[-2:]), 0.5, device=d.device, dtype=d.dtype)
             else:
                 alpha = torch.sigmoid(self.gate(torch.cat([d, r], 1)))
+                if freeze_gate:
+                    alpha = 0.5 + 0.0 * alpha
             a = alpha.repeat_interleave(cfg.feat_dim // cfg.groups, dim=1)
             h = a * d + (1 - a) * r
         params = self.posterior(h)
@@ -290,11 +297,12 @@ class TokenizerV3(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.post_quant_conv(z))
 
-    def forward(self, images: torch.Tensor, dino_layers: torch.Tensor, dino_target: torch.Tensor | None = None) -> dict:
+    def forward(self, images: torch.Tensor, dino_layers: torch.Tensor, dino_target: torch.Tensor | None = None,
+                freeze_gate: bool = False) -> dict:
         """One training forward (what DDP wraps): encode, sample z, update the running moments (training mode),
         decode, and the readout losses when readout != "off". Returns encode()'s dict plus z, x_rec and, with
         readouts, sem / det / det_rgb / det_edge."""
-        out = self.encode(images, dino_layers)
+        out = self.encode(images, dino_layers, freeze_gate=freeze_gate)
         z = self.sample(out["mu"], out["logvar"])
         if self.training:
             self.update_moments(z)

@@ -54,6 +54,19 @@ def test_adaptive_gate_starts_at_half_and_fixed_is_half():
     assert torch.allclose(a, torch.full_like(a, 0.5)) and torch.allclose(f, torch.full_like(f, 0.5))
 
 
+def test_freeze_gate_pins_half_with_zero_gate_gradient():
+    tok = tiny_tok(fusion="adaptive")
+    images, dino = batch()
+    with torch.no_grad():
+        tok.gate[-1].bias.fill_(5.0)                     # an unfrozen gate would give alpha ~ 0.993
+    out = tok(images, dino, torch.randn(3, D, GRID, GRID), freeze_gate=True)
+    assert torch.equal(out["alpha"], torch.full_like(out["alpha"], 0.5))
+    (out["mu"].sum() + out["sem"]).backward()
+    assert tok.gate[-1].weight.grad is not None and float(tok.gate[-1].weight.grad.abs().max()) == 0.0
+    assert float(tok.dino_proj.weight.grad.abs().max()) > 0
+    assert float(tok.encode(images, dino)["alpha"].min()) > 0.99
+
+
 def test_gate_mixes_groups_independently():
     """Group g of the posterior head only reads feature group g, mixed by alpha[:, g]."""
     tok = tiny_tok(fusion="adaptive")

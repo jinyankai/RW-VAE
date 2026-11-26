@@ -4,7 +4,8 @@ Loss (after the warm-up):  l1 * |x_rec - x| + lpips * LPIPS(x_rec, x) + w_sem * 
   KL term: kl.mode=beta -> beta * mean_b sum_{c,h,w} KL   (VA-VAE convention, kl.beta = 1e-6)
            kl.mode=lock -> RateLagrangian(kl.target) on R_hat (nats/token), lambda updated from the rank mean
 Warm-up (tok_train.warmup_steps): loss = MSE(mu, mu_init) with mu_init the posterior mean of the init tokenizer
-(init.ckpt); every other term is computed and multiplied by 0 so DDP sees all parameters. The decoder is
+(init.ckpt); every other term is computed and multiplied by 0 so DDP sees all parameters, and the adaptive gate
+is pinned at alpha = 0.5 (TokenizerV3.encode freeze_gate), so the gate starts learning from 0.5. The decoder is
 initialised from init.ckpt (post_quant_conv + decoder) and trained jointly afterwards.
 Data: train split images, flipped iff rand < 0.5 drawn from Generator(noise_seed(seed, epoch, index)).
 
@@ -183,7 +184,7 @@ def _train(cfg, t, kcfg, args, out_dir, rank, world, device, info, run) -> Path:
             warm = step < int(t["warmup_steps"])
             layers, target = _v3.dino_inputs(dino, images, v3cfg, amp)
             with torch.autocast(device.type, dtype=amp_dtype, enabled=amp):
-                out = net(images, layers, target)
+                out = net(images, layers, target, freeze_gate=warm)
                 lp = lpips_fn(out["x_rec"].float(), images).mean()
             x_rec = out["x_rec"].float()
             l1 = (x_rec - images).abs().mean()
