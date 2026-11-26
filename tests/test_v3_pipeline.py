@@ -162,6 +162,10 @@ def test_v3_pipeline_end_to_end(world):
     run("v3_evaluate", "--arm", "T-c", sub="recon")
     rec = json.loads((exp / "recon" / "T-c" / "recon.json").read_text())
     assert {"psnr", "lpips", "rfid", "rate_nats_per_token"} <= set(rec)
+    assert (exp / "recon" / "T-c" / "recon_pairs.png").is_file()
+    run("v3_evaluate", "--arm", "T-c", "--baseline", sub="recon")
+    base = json.loads((exp / "recon" / "init_baseline" / "recon.json").read_text())
+    assert base["arm"] == "init_baseline" and base["rate_nats_per_token"] > 0
     run("v3_evaluate", "--arm", "T-c", sub="generate")
     run("v3_evaluate", "--arm", "T-c", "--repa", "--cfg-scale", "2.0", sub="generate")
     run("v3_evaluate", "--arm", "T-c", "--uncond", sub="generate")

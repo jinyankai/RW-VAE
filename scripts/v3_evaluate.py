@@ -50,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
         runtime.add_common_args(p)
         _v3.add_arm_arg(p)
         p.add_argument("--tokenizer", default=None, help="tokenizer.pt (default: the arm's tok run)")
+    rec = sub.choices["recon"]
+    rec.add_argument("--baseline", action="store_true", help="evaluate the init tokenizer (init.ckpt) instead")
+    rec.add_argument("--save-grid", type=int, default=16, help="(original, reconstruction) pairs saved as recon_pairs.png")
     for name in ("generate", "cfg-sweep"):
         g = sub.choices[name]
         g.add_argument("--repa", action="store_true", help="use the arm's REPA DiT run")
@@ -103,13 +106,20 @@ class AllChannelCFG(nn.Module):
 
 def cmd_recon(args, cfg: dict) -> int:
     e = cfg["v3_eval"]
-    out_dir = Path(args.out) if args.out else _common.stage_dir(cfg, "recon", args.arm)
+    name = "init_baseline" if args.baseline else args.arm
+    out_dir = Path(args.out) if args.out else _common.stage_dir(cfg, "recon", name)
     run = _common.open_run(__file__, cfg, out_dir, args)
     try:
         device = runtime.select_device(args.device)
         tf32 = _common.set_tf32(False)
-        tok, tok_path = _tokenizer(cfg, args, device)
-        dino = _v3.make_dino(cfg, device)
+        if args.baseline:                    # the init tokenizer (VA-VAE) through the same protocol
+            init = cfg["init"]
+            tok_path = _common.resolve(init["ckpt"])
+            base = integration.FrozenTokenizer.from_checkpoint(tok_path, embed_dim=int(init["embed_dim"]),
+                                                               ch_mult=tuple(init["ch_mult"]), device=device)
+        else:
+            tok, tok_path = _tokenizer(cfg, args, device)
+            dino = _v3.make_dino(cfg, device)
         manifest = _common.load_manifest(cfg)
         n_split = manifest.split_size(e["split"])
         N = n_split if e["max_images"] is None else min(int(e["max_images"]), n_split)
@@ -120,14 +130,18 @@ def cmd_recon(args, cfg: dict) -> int:
         fid_rec = evaluation.FIDStatistics(inception, device, batch_size=int(cfg["fid"]["inception_batch"]))
         fid_ref = evaluation.FIDStatistics(inception, device, batch_size=int(cfg["fid"]["inception_batch"]))
         lp = evaluation.LPIPSMeter(integration.load_lpips(device))
-        psnr, kl_sum, n_tok = [], 0.0, 0
+        psnr, kl_sum, n_tok, grid = [], 0.0, 0, []
         amp = device.type == "cuda"
         with torch.no_grad():
             for x, _, _ in DataLoader(ds, batch_size=int(e["batch_size"]), num_workers=int(e["num_workers"])):
                 x = x.to(device)
-                layers, _ = _v3.dino_inputs(dino, x, tok.cfg, amp)
-                enc = tok.encode(x, layers)
-                x_rec = tok.decode(enc["mu"]).float()
+                if args.baseline:
+                    mu, logvar = base.encode_moments(x)
+                    enc, x_rec = {"mu": mu, "logvar": logvar}, base.decode(mu).float()
+                else:
+                    layers, _ = _v3.dino_inputs(dino, x, tok.cfg, amp)
+                    enc = tok.encode(x, layers)
+                    x_rec = tok.decode(enc["mu"]).float()
                 kl_sum += float(tv3.kl_elementwise(enc["mu"].double(), enc["logvar"].double()).sum())
                 n_tok += x.shape[0] * enc["mu"].shape[2] * enc["mu"].shape[3]
                 u8_rec, u8_ref = evaluation.to_uint8(x_rec), evaluation.to_uint8(x)
@@ -135,15 +149,20 @@ def cmd_recon(args, cfg: dict) -> int:
                 lp.update(x_rec, x)
                 fid_rec.update(u8_rec)
                 fid_ref.update(u8_ref)
+                if sum(len(g) for g in grid) < 2 * int(args.save_grid):
+                    k = int(args.save_grid) - sum(len(g) for g in grid) // 2
+                    grid.append(torch.stack([u8_ref[:k].cpu(), u8_rec[:k].cpu()], 1).flatten(0, 1))
                 run.log_metrics(None, images=sum(len(p) for p in psnr))
         mu1, s1, _ = fid_rec.compute()
         mu2, s2, _ = fid_ref.compute()
-        res = {"arm": args.arm, "split": e["split"], "n": N, "tokenizer": tok_path, "latent": "posterior mean",
+        if grid:                             # pairs (original, reconstruction), row-major
+            _save_grid(torch.cat(grid), out_dir / "recon_pairs.png", cols=8)
+        res = {"arm": name, "split": e["split"], "n": N, "tokenizer": tok_path, "latent": "posterior mean",
                "psnr": float(torch.cat(psnr).double().mean()), "lpips": lp.mean(),
                "rfid": evaluation.frechet_distance(mu1, s1, mu2, s2), "rate_nats_per_token": kl_sum / n_tok,
                "tf32": tf32}
         run.save_json("recon.json", res)
-        run.logger.info("recon %s: %s", args.arm, {k: res[k] for k in ("psnr", "lpips", "rfid", "rate_nats_per_token")})
+        run.logger.info("recon %s: %s", name, {k: res[k] for k in ("psnr", "lpips", "rfid", "rate_nats_per_token")})
         run.finish("ok", **{k: res[k] for k in ("psnr", "lpips", "rfid", "rate_nats_per_token", "n")})
     except BaseException as err:
         run.finish("failed", error=repr(err))
@@ -312,10 +331,10 @@ def cmd_cfg_sweep(args, cfg: dict) -> int:
     return 0
 
 
-def _save_grid(u8: torch.Tensor, path: Path) -> None:
+def _save_grid(u8: torch.Tensor, path: Path, cols: int | None = None) -> None:
     from PIL import Image
     n = u8.shape[0]
-    cols = int(np.ceil(np.sqrt(n)))
+    cols = cols or int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
     _, _, H, W = u8.shape
     canvas = np.zeros((rows * H, cols * W, 3), dtype=np.uint8)
