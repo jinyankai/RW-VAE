@@ -59,6 +59,8 @@ tok_train:
   lpips_weight: 1.0
   w_sem: 0.25
   w_det: 0.25
+  w_vf: 0.1                              # VF loss (v3.vf, arm T-vf): VA-VAE f16d32 vf_weight
+  vf_adaptive: true                      # VA-VAE adaptive_vf: w = w_vf * |grad nll| / |grad vf| at the posterior head
   hflip: true
   mixed_precision: bf16
   log_every: 100
@@ -133,6 +135,7 @@ v3_arms:                                 # §3.1; every arm is merged over v3 / 
   T-d: {v3: {dino_layers: [16, 17, 18, 19, 20, 21, 22, 23]}}
   T-e: {v3: {readout: "off"}}
   T-f: {v3: {readout: shared}}
+  T-vf: {v3: {readout: "off", vf: true}}   # v3.2: VA-VAE VF loss on z in place of the readouts
   L-a: {v3: {fusion: dino_only}, kl: {mode: lock}}
   L-c: {kl: {mode: lock}}
   VA-VAE: {baseline_init: true}          # the init tokenizer itself through the same cache / DiT / eval protocol

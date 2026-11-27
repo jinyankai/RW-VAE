@@ -133,6 +133,33 @@ def test_readout_modes_and_gradients():
     assert not hasattr(tok, "sem_head")
 
 
+def test_vf_loss_margins_projection_and_forward():
+    tok = tiny_tok(readout="off", vf=True)
+    assert tok.vf_proj.bias is None and tok.vf_proj.weight.shape == (D, 8, 1, 1)
+    assert not hasattr(tiny_tok(), "vf_proj")
+    images, dino = batch()
+    z = torch.randn(3, 8, GRID, GRID)
+    target = torch.randn(3, D, GRID, GRID)
+    # z' == target: both terms vanish (cos = 1, identical cosine matrices)
+    with torch.no_grad():
+        assert float(tok.vf_loss(z, tok.vf_proj(z))) < 1e-6
+    # zero margins: the loss is the plain |cosine-matrix diff| + (1 - cos), and margins only lower it
+    strict = tiny_tok(readout="off", vf=True, vf_cos_margin=0.0, vf_distmat_margin=0.0)
+    strict.vf_proj.load_state_dict(tok.vf_proj.state_dict())
+    zn = torch.nn.functional.normalize(tok.vf_proj(z).flatten(2), dim=1)
+    fn = torch.nn.functional.normalize(target.flatten(2), dim=1)
+    ref = ((zn.transpose(1, 2) @ zn - fn.transpose(1, 2) @ fn).abs().mean() + (1 - (zn * fn).sum(1)).mean())
+    assert torch.allclose(strict.vf_loss(z, target), ref, atol=1e-5)
+    assert float(tok.vf_loss(z, target)) <= float(ref) + 1e-6
+    out = tok(images, dino, target)
+    assert "vf" in out and "sem" not in out
+    out["vf"].backward()
+    assert float(tok.dino_proj.weight.grad.abs().sum()) > 0
+    with pytest.raises(ValueError):
+        tok(images, dino)
+    tiny_tok(readout="off")(images, dino)          # neither readouts nor VF: no target needed
+
+
 def test_update_moments_first_call_copies_then_ema():
     tok = tiny_tok()
     z = torch.randn(4, 8, GRID, GRID) * 3 + 1

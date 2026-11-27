@@ -13,6 +13,11 @@ and two heads that see ONLY u_t predict (a) the last DINO block's patch tokens (
 low-resolution RGB image plus an edge map (L1). readout="split" uses t_sem for (a) and t_det for (b);
 "shared" draws one t ~ U(0, 1) per sample for both heads (the RoAR-VAE protocol, arm T-f); "off" has no
 heads. The DINO network itself is not part of this module: callers pass its features in.
+
+VF loss (vf=True, arm T-vf): VA-VAE's alignment of the clean z with the last DINO block, as in LightningDiT
+vavae/ldm/modules/losses/contperceptual.py: z -> 1x1 conv (no bias) to the DINO width, then a marginal
+token-pair cosine-matrix term plus a marginal per-position cosine term. The adaptive weight lives in the
+training script.
 """
 from __future__ import annotations
 
@@ -48,6 +53,9 @@ class V3Config:
     sem_heads: int = 8
     det_width: int = 256
     moments_momentum: float = 0.99
+    vf: bool = False
+    vf_cos_margin: float = 0.5                                       # VA-VAE f16d32 cos_margin
+    vf_distmat_margin: float = 0.25                                  # VA-VAE f16d32 distmat_margin
 
     def __post_init__(self) -> None:
         if self.fusion not in FUSIONS:
@@ -241,6 +249,8 @@ class TokenizerV3(nn.Module):
             self.sem_head = SemanticReadout(cfg.latent_dim, cfg.dino_dim, cfg.sem_width, cfg.sem_depth,
                                             cfg.sem_heads, self.grid)
             self.det_head = DetailReadout(cfg.latent_dim, cfg.det_width)
+        if cfg.vf:
+            self.vf_proj = nn.Conv2d(cfg.latent_dim, cfg.dino_dim, 1, bias=False)
         self.register_buffer("z_mean", torch.zeros(cfg.latent_dim))
         self.register_buffer("z_var", torch.ones(cfg.latent_dim))
         self.register_buffer("moments_init", torch.zeros((), dtype=torch.bool))
@@ -300,18 +310,31 @@ class TokenizerV3(nn.Module):
     def forward(self, images: torch.Tensor, dino_layers: torch.Tensor, dino_target: torch.Tensor | None = None,
                 freeze_gate: bool = False) -> dict:
         """One training forward (what DDP wraps): encode, sample z, update the running moments (training mode),
-        decode, and the readout losses when readout != "off". Returns encode()'s dict plus z, x_rec and, with
-        readouts, sem / det / det_rgb / det_edge."""
+        decode, the readout losses when readout != "off" and the VF loss when vf. Returns encode()'s dict plus
+        z, x_rec and, with readouts, sem / det / det_rgb / det_edge, with vf, vf."""
         out = self.encode(images, dino_layers, freeze_gate=freeze_gate)
         z = self.sample(out["mu"], out["logvar"])
         if self.training:
             self.update_moments(z)
         out.update(z=z, x_rec=self.decode(z))
+        if (self.cfg.readout != "off" or self.cfg.vf) and dino_target is None:
+            raise ValueError("the readouts and the VF loss need dino_target")
         if self.cfg.readout != "off":
-            if dino_target is None:
-                raise ValueError("the readouts need dino_target")
             out.update(self.readout_losses(z, images, dino_target))
+        if self.cfg.vf:
+            out["vf"] = self.vf_loss(z, dino_target)
         return out
+
+    def vf_loss(self, z: torch.Tensor, dino_target: torch.Tensor) -> torch.Tensor:
+        """VA-VAE VF loss of z [B, C, g, g] against the DINO tokens [B, D, g, g]: with z' = vf_proj(z),
+        mean relu(|cos(z'_i, z'_j) - cos(f_i, f_j)| - distmat_margin) over each image's token pairs
+        + mean relu(1 - cos_margin - cos(z'_i, f_i)) over positions."""
+        zn = F.normalize(self.vf_proj(z).float().flatten(2), dim=1)
+        fn = F.normalize(dino_target.float().flatten(2), dim=1)
+        diff = (torch.einsum("bci,bcj->bij", zn, zn) - torch.einsum("bci,bcj->bij", fn, fn)).abs()
+        distmat = F.relu(diff - self.cfg.vf_distmat_margin).mean()
+        cos = F.relu(1 - self.cfg.vf_cos_margin - (zn * fn).sum(1)).mean()
+        return distmat + cos
 
     # ---------------------------------------------------------------- noise-level readouts
     @torch.no_grad()

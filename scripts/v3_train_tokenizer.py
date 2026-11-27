@@ -1,6 +1,9 @@
 """v3 -- train the RW-VAE v3 tokenizer of one arm (RWVAE_V3_ALLOCATION_PLAN.md v3.1 §2.1-2.4, §3.1 stage B).
 
-Loss (after the warm-up):  l1 * |x_rec - x| + lpips * LPIPS(x_rec, x) + w_sem * L_sem + w_det * L_det + KL term
+Loss (after the warm-up):  l1 * |x_rec - x| + lpips * LPIPS(x_rec, x) + w_sem * L_sem + w_det * L_det
+                           + w * L_vf + KL term
+  L_vf (v3.vf only): VA-VAE VF loss; with tok_train.vf_adaptive w = w_vf * |grad L_nll| / (|grad L_vf| + 1e-4) at
+           the posterior head weight (the encoder's last layer; L_nll = the L1 + LPIPS part), else w = w_vf
   KL term: kl.mode=beta -> beta * mean_b sum_{c,h,w} KL   (VA-VAE convention, kl.beta = 1e-6)
            kl.mode=lock -> RateLagrangian(kl.target) on R_hat (nats/token), lambda updated from the rank mean
 Warm-up (tok_train.warmup_steps): loss = MSE(mu, mu_init) with mu_init the posterior mean of the init tokenizer
@@ -67,6 +70,14 @@ class RandomFlipImages(Dataset):
         g = torch.Generator().manual_seed(noise_seed(self.seed, self.epoch, i))
         flip = bool(torch.rand((), generator=g) < self.p)
         return (self.flipped if flip else self.plain)[i]
+
+
+def adaptive_vf_weight(nll: torch.Tensor, vf: torch.Tensor, layer: torch.Tensor, scale: float) -> torch.Tensor:
+    """VA-VAE calculate_adaptive_weight_vf: scale * |d nll / d layer| / (|d vf / d layer| + 1e-4), clamped to
+    [0, 1e8], detached. Local to the rank (autograd.grad does not touch .grad, so DDP's hooks do not fire)."""
+    g_nll = torch.autograd.grad(nll, layer, retain_graph=True)[0]
+    g_vf = torch.autograd.grad(vf, layer, retain_graph=True)[0]
+    return (g_nll.norm() / (g_vf.norm() + 1e-4)).clamp(0.0, 1e8).detach() * float(scale)
 
 
 def _checkpoints(ckpt_dir: Path) -> list[tuple[int, Path]]:
@@ -169,7 +180,7 @@ def _train(cfg, t, kcfg, args, out_dir, rank, world, device, info, run) -> Path:
          cfg["arm"], v3cfg.to_dict(), n_enc / 1e6, sum(p.numel() for p in tok.decoder_parameters()) / 1e6, world,
          batch, steps_per_epoch)
 
-    keys = ("loss", "l1", "lpips", "sem", "det", "rate", "warm_mse", "alpha", "grad_norm")
+    keys = ("loss", "l1", "lpips", "sem", "det", "vf", "vf_w", "rate", "warm_mse", "alpha", "grad_norm")
     sums = torch.zeros(len(keys), dtype=torch.float64, device=device)
     n_win, t_win = 0, time.perf_counter()
     max_steps = int(t["max_steps"])
@@ -196,9 +207,13 @@ def _train(cfg, t, kcfg, args, out_dir, rank, world, device, info, run) -> Path:
             else:
                 kl_term, delta = lag.loss(rate)
             zero = torch.zeros((), device=device)
-            sem, det = out.get("sem", zero), out.get("det", zero)
-            main = (float(t["l1_weight"]) * l1 + float(t["lpips_weight"]) * lp + float(t["w_sem"]) * sem
-                    + float(t["w_det"]) * det + kl_term)
+            sem, det, vf = out.get("sem", zero), out.get("det", zero), out.get("vf", zero)
+            nll = float(t["l1_weight"]) * l1 + float(t["lpips_weight"]) * lp
+            vf_w = zero
+            if v3cfg.vf:
+                vf_w = (adaptive_vf_weight(nll, vf, tok.posterior.weight, t["w_vf"])
+                        if t["vf_adaptive"] and not warm else torch.full((), float(t["w_vf"]), device=device))
+            main = nll + float(t["w_sem"]) * sem + float(t["w_det"]) * det + vf_w * vf + kl_term
             if warm:
                 with torch.no_grad():
                     mu_init = teacher.encode_mean(images)
@@ -224,8 +239,8 @@ def _train(cfg, t, kcfg, args, out_dir, rank, world, device, info, run) -> Path:
             step += 1
             done += 1
             alpha = out["alpha"].float().mean() if out["alpha"] is not None else torch.ones((), device=device)
-            sums += torch.stack([loss.detach(), l1.detach(), lp.detach(), sem.detach(), det.detach(), rate.detach(),
-                                 warm_mse.detach(), alpha.detach(), grad_norm]).double()
+            sums += torch.stack([loss.detach(), l1.detach(), lp.detach(), sem.detach(), det.detach(), vf.detach(),
+                                 vf_w.detach(), rate.detach(), warm_mse.detach(), alpha.detach(), grad_norm]).double()
             n_win += 1
             if step % int(t["log_every"]) == 0 or step == max_steps:
                 means = sums / n_win
